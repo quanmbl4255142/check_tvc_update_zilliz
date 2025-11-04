@@ -18,43 +18,10 @@
       <div class="flex items-center gap-2">
         <a href="{{ url_for('index') }}" class="btn-secondary">← Tải video khác</a>
         <a href="/web_outputs/{{ job_id }}/result.json" class="btn-primary" download>Tải JSON</a>
-        {% if frames and frames[0].get('caption') %}
-        <form method="post" action="{{ url_for('label_job', job_id=job_id) }}">
-          <input type="hidden" name="clf_dir" value="{{ ("../TVC-AI/output_moderation") }}" />
-          <button class="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500" type="submit">Gán nhãn caption</button>
-        </form>
-        {% endif %}
       </div>
     </div>
 
-    {# Detect if captions are missing (first frame no caption) #}
-    {% set has_caption = frames and frames[0].get('caption') %}
-    {% if not has_caption %}
-      <div class="card p-6 mb-6">
-        <h4 class="text-lg font-semibold mb-2">Tạo mô tả cho các ảnh</h4>
-        <p class="text-sm text-slate-500 mb-4">Hiện tại mới trích xuất ảnh. Bạn có thể tạo mô tả (caption) ngay bây giờ.</p>
-        <form method="post" action="{{ url_for('caption_job', job_id=job_id) }}" class="grid sm:grid-cols-2 gap-4 items-end">
-          <div>
-            <label class="label" for="language">Ngôn ngữ</label>
-            <select id="language" name="language" class="block w-full rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-4 py-3 text-base text-slate-900 dark:text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500">
-              <option value="vi" selected>Tiếng Việt (vi)</option>
-              <option value="en">English (en)</option>
-            </select>
-          </div>
-          <div>
-            <label class="label" for="hf_model">HF model</label>
-            <input type="text" id="hf_model" name="hf_model" value="Salesforce/blip-image-captioning-base" class="block w-full rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-4 py-3 text-base text-slate-900 dark:text-slate-100 placeholder-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500" />
-          </div>
-          <label class="inline-flex items-center gap-2">
-            <input type="checkbox" name="translate" checked class="checkbox" />
-            <span class="text-sm">Dịch sang ngôn ngữ đích (khi dùng Local)</span>
-          </label>
-          <div class="flex gap-3">
-            <button class="inline-flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-6 py-3 text-base font-semibold text-white shadow hover:bg-indigo-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500" type="submit">Tạo mô tả ngay</button>
-          </div>
-        </form>
-      </div>
-    {% endif %}
+    {# Captioning and labeling UI removed #}
 
     {% if frames|length == 0 %}
       <div class="card p-6">
@@ -81,28 +48,7 @@
                   {% endif %}
                 {% endif %}
               </div>
-              <p class="text-sm text-slate-700 dark:text-slate-200">{{ f.caption }}</p>
-              {% if f.get('label_id') is not none %}
-                <div class="mt-2 flex items-center gap-2">
-                  <span class="inline-flex items-center rounded-full bg-emerald-50 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200 px-2 py-1 text-xs font-medium">Nhãn: {{ f.get('label_id') }}</span>
-                  {% if f.get('label_score') is not none %}
-                    <span class="text-xs text-slate-500">score: {{ '%.2f'|format(f.get('label_score')) }}</span>
-                  {% endif %}
-                </div>
-              {% endif %}
-              {% if f.moderation and (f.moderation.categories or f.moderation.labels) %}
-                <div class="mt-2 flex flex-wrap gap-2">
-                  {% if f.moderation.categories %}
-                    {% for cat in f.moderation.categories %}
-                      <span class="inline-flex items-center rounded bg-slate-200 dark:bg-slate-700 px-2 py-0.5 text-[11px] uppercase tracking-wide">{{ cat }}</span>
-                    {% endfor %}
-                  {% else %}
-                    {% for label in f.moderation.labels %}
-                      <span class="inline-flex items-center rounded bg-slate-200 dark:bg-slate-700 px-2 py-0.5 text-[11px] uppercase tracking-wide">{{ label }}</span>
-                    {% endfor %}
-                  {% endif %}
-                </div>
-              {% endif %}
+              {# Caption/label display removed #}
             </div>
           </div>
         {% endfor %}

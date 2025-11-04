@@ -2,6 +2,7 @@ __pycache__/
 .venv/
 uploads/
 web_outputs/
+batch_outputs/
 *.mp4
 *.png
 *.csv
@@ -13,3 +14,4 @@ web_outputs/
 *checkpoint*
 .DS_Store
 .env
+*.npy

@@ -22,9 +22,10 @@ from rich.progress import track
 
 console = Console()
 
-# Cache for local HF captioning pipelines to avoid reloading per frame
-_CAPTION_PIPELINE_CACHE: Dict[str, object] = {}
-_TEXT_CLASSIFIER_CACHE: Optional[Dict[str, object]] = None
+# (Captioning/labeling functionality removed)
+
+# Cache for CLIP embedding model
+_CLIP_CACHE: Optional[Dict[str, object]] = None
 
 
 @dataclass
@@ -85,110 +86,54 @@ def extract_frames_1fps(video_path: str, output_dir: str) -> List[str]:
     return saved_paths
 
 
-# ------------------------ Local HF captioning ------------------------
+# (Captioning, labeling, translation removed)
 
-def _get_local_captioner(model_name: str):
-    """Create or fetch a cached HF pipeline for image captioning."""
-    from transformers import pipeline
+
+def _get_clip_model(model_id: str = "openai/clip-vit-base-patch32"):
+    """Load and cache CLIP processor/model on CPU/GPU."""
+    global _CLIP_CACHE
+    if _CLIP_CACHE and _CLIP_CACHE.get("id") == model_id:
+        return _CLIP_CACHE["processor"], _CLIP_CACHE["model"], _CLIP_CACHE["device"]
     try:
-        import torch  # prefer GPU if available
-        has_cuda = torch.cuda.is_available()
-    except Exception:
-        has_cuda = False
-
-    default_model = "Salesforce/blip-image-captioning-base"
-    use_model = model_name or default_model
-
-    if use_model in _CAPTION_PIPELINE_CACHE:
-        return _CAPTION_PIPELINE_CACHE[use_model]
-
-    device = 0 if has_cuda else -1
-    # Try safetensors first; if unavailable, fallback to default loader
-    try:
-        captioner = pipeline(
-            "image-to-text",
-            model=use_model,
-            device=device,
-            model_kwargs={"use_safetensors": True},
-        )
-    except Exception:
-        captioner = pipeline(
-            "image-to-text",
-            model=use_model,
-            device=device,
-        )
-    _CAPTION_PIPELINE_CACHE[use_model] = captioner
-    return captioner
-
-
-def caption_image_local(image_path: str, model_name: str) -> str:
-    """Caption an image using a local Hugging Face pipeline model (cached)."""
-    captioner = _get_local_captioner(model_name)
-    result = captioner(image_path, max_new_tokens=64)
-    # result like: [{"generated_text": "..."}]
-    if isinstance(result, list) and result:
-        item = result[0]
-        text = item.get("generated_text", "").strip()
-        return text
-    return ""
-
-
-# ------------------------ Text classifier (HF) ------------------------
-
-def _get_text_classifier(model_dir: str):
-    global _TEXT_CLASSIFIER_CACHE
-    if _TEXT_CLASSIFIER_CACHE and _TEXT_CLASSIFIER_CACHE.get("dir") == model_dir:
-        return _TEXT_CLASSIFIER_CACHE["tokenizer"], _TEXT_CLASSIFIER_CACHE["model"], _TEXT_CLASSIFIER_CACHE["device"]
-    try:
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        from transformers import AutoProcessor, CLIPModel
         import torch
         has_cuda = torch.cuda.is_available()
         device = torch.device("cuda" if has_cuda else "cpu")
-        tokenizer = AutoTokenizer.from_pretrained(model_dir)
-        model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+        processor = AutoProcessor.from_pretrained(model_id)
+        model = CLIPModel.from_pretrained(model_id)
         model.to(device)
         model.eval()
-        _TEXT_CLASSIFIER_CACHE = {"dir": model_dir, "tokenizer": tokenizer, "model": model, "device": device}
-        return tokenizer, model, device
+        _CLIP_CACHE = {"id": model_id, "processor": processor, "model": model, "device": device}
+        return processor, model, device
     except Exception as e:
-        raise RuntimeError(f"Cannot load classifier from: {model_dir}. {e}")
+        raise RuntimeError(f"Cannot load CLIP model {model_id}: {e}")
 
 
-def classify_text(text: str, model_dir: str) -> Dict[str, object]:
-    if not text:
-        return {"label_id": None, "score": 0.0, "probs": []}
-    tokenizer, model, device = _get_text_classifier(model_dir)
+def embed_image_clip(image_path: str, model_id: str = "openai/clip-vit-base-patch32") -> List[float]:
+    """Compute CLIP image embedding for the given image and return as list of floats."""
+    from PIL import Image as PILImage
     import torch
+    import numpy as np
+    processor, model, device = _get_clip_model(model_id)
     with torch.no_grad():
-        enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
-        enc = {k: v.to(device) for k, v in enc.items()}
-        outputs = model(**enc)
-        logits = outputs.logits.detach().cpu().numpy()[0]
-    # softmax
-    ex = np.exp(logits - np.max(logits))
-    probs = (ex / ex.sum()).tolist()
-    label_id = int(np.argmax(probs))
-    score = float(probs[label_id])
-    return {"label_id": label_id, "score": score, "probs": probs}
+        image = PILImage.open(image_path).convert("RGB")
+        inputs = processor(images=image, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(device)
+        image_features = model.get_image_features(pixel_values=pixel_values)
+        image_features = image_features.detach().cpu().numpy()[0]
+        # Optionally L2-normalize for cosine usage
+        norm = np.linalg.norm(image_features) or 1.0
+        image_features = (image_features / norm).astype(np.float32)
+        return image_features.tolist()
 
 
-# ------------------------ Optional translation ------------------------
-
-def translate_text(text: str, target_lang: str) -> str:
-    if not text or not target_lang:
-        return text
-    # Use deep-translator (Google translate) as a simple online translation helper
-    try:
-        from deep_translator import GoogleTranslator
-        dest = target_lang
-        # Normalize some common aliases
-        if dest.lower() in {"vi", "vn", "vie", "vietnamese", "tiếng việt"}:
-            dest = "vi"
-        translated = GoogleTranslator(source="auto", target=dest).translate(text)
-        return translated or text
-    except Exception:
-        # If translation fails (no internet / quota), return original
-        return text
+def embed_image_clip_to_npy(image_path: str, out_path: str, model_id: str = "openai/clip-vit-base-patch32") -> None:
+    """Compute CLIP embedding and save to .npy file."""
+    import numpy as np
+    vec = embed_image_clip(image_path, model_id=model_id)
+    arr = np.asarray(vec, dtype=np.float32)
+    ensure_dir(os.path.dirname(out_path))
+    np.save(out_path, arr)
 
 
 # ------------------------ CLI ------------------------
@@ -196,13 +141,9 @@ def translate_text(text: str, target_lang: str) -> str:
 @click.command()
 @click.option("--input", "input_video", required=False, type=click.Path(exists=True, dir_okay=False), help="Path to input video")
 @click.option("--out_dir", default="output", type=click.Path(dir_okay=True, file_okay=False), help="Directory to write frames and captions")
-@click.option("--hf_model", default="Salesforce/blip-image-captioning-base", help="Hugging Face model id for local backend")
-@click.option("--clf_dir", default=os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "TVC-AI", "output_moderation")), help="Directory of trained text classifier to label captions")
-@click.option("--language", default="vi", help="Preferred caption language (e.g., vi, en)")
-@click.option("--translate", is_flag=True, default=True, help="Translate captions to the target language if backend returns other language")
 @click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing frame files")
 @click.option("--serve/--no-serve", "serve_web", default=True, help="Also start the web UI server (default: on)")
-def main(input_video: str, out_dir: str, hf_model: str, language: str, translate: bool, overwrite: bool, serve_web: bool, clf_dir: str) -> None:
+def main(input_video: str, out_dir: str, overwrite: bool, serve_web: bool) -> None:
     console.rule("Video to Step Images + Captions (1 fps)")
 
     web_proc = None
@@ -215,7 +156,7 @@ def main(input_video: str, out_dir: str, hf_model: str, language: str, translate
             console.print(f"[yellow]Không thể khởi động web UI:[/yellow] {e}")
             web_proc = None
 
-    # Nếu có video đầu vào thì chạy xử lý CLI, ngược lại chỉ chạy web và giữ tiến trình
+    # Nếu có video đầu vào thì chỉ tách khung hình 1fps; bỏ mô tả và gán nhãn
     if input_video:
         frames_dir = os.path.join(out_dir, "frames")
         ensure_dir(out_dir)
@@ -226,52 +167,10 @@ def main(input_video: str, out_dir: str, hf_model: str, language: str, translate
                 except Exception:
                     pass
         ensure_dir(frames_dir)
-        # 1) Extract frames at 1 fps
+        # Extract frames at 1 fps
         frame_paths = extract_frames_1fps(input_video, frames_dir)
         console.print(f"[green]Extracted {len(frame_paths)} frame(s) into {frames_dir}[/green]")
-        # 2) Caption each frame (Local HF only)
-        results: List[CaptionResult] = []
-        labels: List[Dict[str, object]] = []
-        for image_path in track(frame_paths, description="Captioning frames"):
-            base = os.path.basename(image_path)
-            try:
-                sec = int(os.path.splitext(base)[0].split("_")[-1])
-            except Exception:
-                sec = len(results)
-            caption_en = caption_image_local(image_path, hf_model)
-            final_caption = caption_en
-            if translate and language and language.lower() not in {"en", "english"}:
-                final_caption = translate_text(caption_en, language)
-            results.append(CaptionResult(second=sec, image_path=image_path, caption=final_caption))
-            try:
-                pred = classify_text(final_caption, clf_dir)
-            except Exception as e:
-                pred = {"label_id": None, "score": 0.0, "probs": [], "error": str(e)}
-            labels.append(pred)
-        # Xuất kết quả ra CSV, Markdown
-        import pandas as pd
-        df = pd.DataFrame([
-            {
-                "second": r.second,
-                "image_path": os.path.relpath(r.image_path, out_dir),
-                "caption": r.caption,
-                "label_id": (labels[i].get("label_id") if i < len(labels) else None),
-                "label_score": (labels[i].get("score") if i < len(labels) else None),
-            }
-            for i, r in enumerate(results)
-        ]).sort_values("second")
-        csv_path = os.path.join(out_dir, "captions.csv")
-        md_path = os.path.join(out_dir, "captions.md")
-        df.to_csv(csv_path, index=False, encoding="utf-8")
-        with open(md_path, "w", encoding="utf-8") as fmd:
-            fmd.write(f"# Mô tả từng bước (1 giây/ảnh)\n\n")
-            for _, row in df.iterrows():
-                fmd.write(f"## Giây {int(row.second)}\n\n")
-                path_md = row.image_path.replace("\\", "/")
-                fmd.write(f"![frame](./{path_md})\n\n")
-                fmd.write(f"- Mô tả: {row.caption}\n")
-                fmd.write(f"- Nhãn: {row.label_id} (score: {row.label_score})\n\n")
-        console.print(f"[bold green]Done[/bold green]. Results written to: \n- {csv_path}\n- {md_path}")
+        console.print(f"[bold green]Done[/bold green]. Chỉ tách khung hình, không tạo mô tả hay gán nhãn.")
         if web_proc is not None:
             try:
                 web_proc.wait()

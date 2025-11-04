@@ -9,10 +9,7 @@ from flask import Flask, render_template, request, redirect, url_for, send_from_
 from app import (
     ensure_dir,
     extract_frames_1fps,
-    caption_image_local,
-    translate_text,
-    CaptionResult,
-    classify_text,
+    embed_image_clip_to_npy,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,12 +52,24 @@ def _unique_path(directory: str, filename: str) -> str:
 def process_video(job_id: str, video_path: str, backend: str, language: str, hf_model: str, openai_model: str, translate: bool) -> Dict:
     out_dir = os.path.join(OUTPUT_DIR, job_id)
     frames_dir = os.path.join(out_dir, "frames")
+    embeds_dir = os.path.join(out_dir, "embeddings")
     ensure_dir(out_dir)
     ensure_dir(frames_dir)
+    ensure_dir(embeds_dir)
 
     frame_paths = extract_frames_1fps(video_path, frames_dir)
 
-    # Step 1: Save frames only; no captions yet
+    # Compute CLIP embeddings for frames and store as .npy alongside
+    for p in frame_paths:
+        name = os.path.splitext(os.path.basename(p))[0] + ".npy"
+        out_npy = os.path.join(embeds_dir, name)
+        try:
+            embed_image_clip_to_npy(p, out_npy, model_id="openai/clip-vit-base-patch32")
+        except Exception as e:
+            # Continue even if one embedding fails
+            pass
+
+    # Save metadata: frames with relative paths to images and embeddings
     data = {
         "job_id": job_id,
         "out_dir": out_dir,
@@ -68,6 +77,10 @@ def process_video(job_id: str, video_path: str, backend: str, language: str, hf_
             {
                 "second": int(os.path.splitext(os.path.basename(p))[0].split("_")[-1]),
                 "image_rel": os.path.relpath(p, out_dir).replace("\\", "/"),
+                "embedding_rel": os.path.relpath(
+                    os.path.join(embeds_dir, os.path.splitext(os.path.basename(p))[0] + ".npy"),
+                    out_dir,
+                ).replace("\\", "/"),
             }
             for p in frame_paths
         ],
@@ -80,42 +93,14 @@ def process_video(job_id: str, video_path: str, backend: str, language: str, hf_
     return data
 
 
-def caption_existing(job_id: str, language: str, hf_model: str, translate: bool) -> Dict:
-    out_dir = os.path.join(OUTPUT_DIR, job_id)
-    frames_dir = os.path.join(out_dir, "frames")
-    meta_path = os.path.join(out_dir, "result.json")
-    if not os.path.exists(meta_path):
-        raise RuntimeError("result.json not found for this job")
-    with open(meta_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # Caption all frames listed in result.json
-    updated_frames = []
-    for item in data.get("frames", []):
-        image_path = os.path.join(out_dir, item["image_rel"]).replace("/", os.sep)
-        if not os.path.exists(image_path):
-            continue
-        if True:  # local backend only
-            cap_en = caption_image_local(image_path, hf_model)
-            final = cap_en
-            if translate and language and language.lower() not in {"en", "english"}:
-                final = translate_text(cap_en, language)
-        updated_frames.append({
-            "second": item["second"],
-            "image_rel": item["image_rel"],
-            "caption": final,
-        })
-
-    data["frames"] = sorted(updated_frames, key=lambda x: x["second"])
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    return data
+# Captioning functionality removed
 
 
 @app.route("/")
 def index():
     # List existing uploaded videos
     uploads = []
+    jobs = []
     try:
         if os.path.isdir(UPLOAD_DIR):
             for name in os.listdir(UPLOAD_DIR):
@@ -133,10 +118,31 @@ def index():
                     continue
         # Sort by most recent
         uploads.sort(key=lambda x: x["mtime"], reverse=True)
+        # List existing processed jobs (web_outputs/<job_id>/result.json)
+        if os.path.isdir(OUTPUT_DIR):
+            for job_id in os.listdir(OUTPUT_DIR):
+                job_dir = os.path.join(OUTPUT_DIR, job_id)
+                meta = os.path.join(job_dir, "result.json")
+                if not os.path.isfile(meta):
+                    continue
+                try:
+                    stat = os.stat(meta)
+                    with open(meta, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    frames = data.get("frames", [])
+                    jobs.append({
+                        "job_id": job_id,
+                        "count": len(frames),
+                        "mtime": stat.st_mtime,
+                    })
+                except Exception:
+                    continue
+            jobs.sort(key=lambda x: x["mtime"], reverse=True)
     except Exception:
         uploads = []
+        jobs = []
 
-    return render_template("index.html", uploads=uploads)
+    return render_template("index.html", uploads=uploads, jobs=jobs)
 
 
 @app.route("/upload", methods=["POST"])
@@ -208,55 +214,10 @@ def result(job_id: str):
     return render_template("result.html", error=None, job_id=job_id, frames=data.get("frames", []), out_dir=out_dir)
 
 
-@app.route("/caption/<job_id>", methods=["POST"])
-def caption_job(job_id: str):
-    language = request.form.get("language", "vi")
-    hf_model = request.form.get("hf_model", "Salesforce/blip-image-captioning-base")
-    translate = request.form.get("translate", "on") == "on"
-    try:
-        caption_existing(job_id, language, hf_model, translate)
-    except Exception as e:
-        out_dir = os.path.join(OUTPUT_DIR, job_id)
-        return render_template("result.html", error=str(e), job_id=job_id, frames=[], out_dir=out_dir)
-    return redirect(url_for("result", job_id=job_id))
+# Caption endpoint removed
 
 
-@app.route("/label/<job_id>", methods=["POST"])
-def label_job(job_id: str):
-    # Label existing captions in result.json without re-captioning
-    out_dir = os.path.join(OUTPUT_DIR, job_id)
-    meta_path = os.path.join(out_dir, "result.json")
-    if not os.path.exists(meta_path):
-        abort(404)
-    # classifier directory (reuse default from app.py CLI default)
-    clf_dir = request.form.get(
-        "clf_dir",
-        os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "TVC-AI", "output_moderation")),
-    )
-    try:
-        with open(meta_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        frames = data.get("frames", [])
-        updated = []
-        for item in frames:
-            cap = item.get("caption", "")
-            if cap:
-                try:
-                    pred = classify_text(cap, clf_dir)
-                except Exception as e:
-                    pred = {"label_id": None, "score": 0.0, "probs": [], "error": str(e)}
-            else:
-                pred = {"label_id": None, "score": 0.0, "probs": []}
-            new_item = dict(item)
-            new_item["label_id"] = pred.get("label_id")
-            new_item["label_score"] = pred.get("score")
-            updated.append(new_item)
-        data["frames"] = updated
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return redirect(url_for("result", job_id=job_id))
-    except Exception as e:
-        return render_template("result.html", error=str(e), job_id=job_id, frames=[], out_dir=out_dir)
+# Label endpoint removed
 
 
 @app.route("/outputs/<job_id>/frames/<path:filename>")
