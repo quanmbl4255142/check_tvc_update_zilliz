@@ -10,3 +10,4 @@ pandas>=2.2.2
 deep-translator>=1.11.4
 openai>=1.42.0
 Flask>=3.0.0
+pymilvus>=2.3.0

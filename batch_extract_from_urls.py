@@ -76,24 +76,49 @@ def download_video(url: str, dest_path: str) -> None:
         raise RuntimeError(f"Download failed: {e}")
 
 
-def process_url(index: int, url: str, out_root: str, overwrite: bool) -> tuple[str, int, Optional[str]]:
+def extract_frame_at_position(cap: cv2.VideoCapture, position: float) -> Optional[Image.Image]:
+    """Extract a single frame at given position (0.0 = start, 0.5 = middle, 0.9 = near end)"""
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if total_frames <= 0 or fps <= 0:
+            return None
+        
+        target_frame = int(total_frames * position)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        success, frame = cap.read()
+        
+        if success and frame is not None:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(rgb)
+    except Exception:
+        pass
+    return None
+
+
+def process_url(index: int, url: str, out_root: str, overwrite: bool, num_frames: int = 3) -> tuple[str, int, Optional[str]]:
+    """
+    Process a video URL and extract embeddings from multiple frames.
+    
+    Args:
+        num_frames: 1 (fast, only first frame) or 3 (robust, first/middle/last frames)
+    """
     job_id = f"url_{index:04d}"
     job_dir = os.path.join(out_root, job_id)
-    # Save only the embedding (no frame image saved in repo)
-    first_embed_path = os.path.join(job_dir, "first_frame.npy")
+    
+    # Define frame paths based on num_frames
+    frame_names = ["first_frame.npy", "middle_frame.npy", "last_frame.npy"]
+    embed_paths = [os.path.join(job_dir, name) for name in frame_names[:num_frames]]
     url_txt_path = os.path.join(job_dir, "url.txt")
+    
     ensure_dir(job_dir)
     if overwrite:
-        try:
-            if os.path.exists(first_embed_path):
-                os.remove(first_embed_path)
-        except Exception:
-            pass
-        try:
-            if os.path.exists(url_txt_path):
-                os.remove(url_txt_path)
-        except Exception:
-            pass
+        for path in embed_paths + [url_txt_path]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
     # Persist the source URL into the job folder
     try:
@@ -102,54 +127,112 @@ def process_url(index: int, url: str, out_root: str, overwrite: bool) -> tuple[s
     except Exception:
         pass
 
-    # Download to temp file
     with tempfile.TemporaryDirectory() as tdir:
+        # METHOD 1: Thử mở trực tiếp từ URL (không cần download)
+        frames_extracted = 0
+        try:
+            cap = cv2.VideoCapture(url)
+            if cap.isOpened():
+                if num_frames == 1:
+                    # Fast mode: only first frame
+                    cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+                    success, frame = cap.read()
+                    if success and frame is not None:
+                        temp_path = os.path.join(tdir, "frame_0.png")
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        img = Image.fromarray(rgb)
+                        img.save(temp_path)
+                        embed_image_clip_to_npy(temp_path, embed_paths[0], model_id="openai/clip-vit-base-patch32")
+                        frames_extracted = 1
+                else:
+                    # Robust mode: 3 frames (first, middle, last)
+                    positions = [0.0, 0.5, 0.9]  # 0%, 50%, 90% (avoid credits at 100%)
+                    for i, pos in enumerate(positions):
+                        img = extract_frame_at_position(cap, pos)
+                        if img:
+                            temp_path = os.path.join(tdir, f"frame_{i}.png")
+                            img.save(temp_path)
+                            embed_image_clip_to_npy(temp_path, embed_paths[i], model_id="openai/clip-vit-base-patch32")
+                            frames_extracted += 1
+                
+                cap.release()
+                if frames_extracted > 0:
+                    return job_id, frames_extracted, None
+        except Exception:
+            pass  # Nếu thất bại, thử phương án 2
+        
+        # METHOD 2: Download video nếu không mở được trực tiếp (dự phòng)
         tmp_path = os.path.join(tdir, safe_slug(os.path.basename(url)) or "video.mp4")
         try:
             download_video(url, tmp_path)
         except Exception as e:
             return job_id, 0, f"download_error: {e}"
 
-        # Capture only the first frame (kept in temp only)
+        # Extract frames from downloaded video
+        frames_extracted = 0
         try:
             cap = cv2.VideoCapture(tmp_path)
             if not cap.isOpened():
                 return job_id, 0, "video_open_error"
-            cap.set(cv2.CAP_PROP_POS_MSEC, 0)
-            success, frame = cap.read()
-            if not success or frame is None:
-                cap.release()
-                return job_id, 0, "read_first_frame_error"
-            # Save first frame to temp path (not in repo) only to compute embedding
-            temp_frame_path = os.path.join(tdir, "first_frame.png")
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(rgb)
-            img.save(temp_frame_path)
+            
+            if num_frames == 1:
+                # Fast mode: only first frame
+                cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+                success, frame = cap.read()
+                if success and frame is not None:
+                    temp_path = os.path.join(tdir, "frame_0.png")
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(rgb)
+                    img.save(temp_path)
+                    embed_image_clip_to_npy(temp_path, embed_paths[0], model_id="openai/clip-vit-base-patch32")
+                    frames_extracted = 1
+            else:
+                # Robust mode: 3 frames
+                positions = [0.0, 0.5, 0.9]
+                for i, pos in enumerate(positions):
+                    img = extract_frame_at_position(cap, pos)
+                    if img:
+                        temp_path = os.path.join(tdir, f"frame_{i}.png")
+                        img.save(temp_path)
+                        embed_image_clip_to_npy(temp_path, embed_paths[i], model_id="openai/clip-vit-base-patch32")
+                        frames_extracted += 1
+            
             cap.release()
+            
+            if frames_extracted == 0:
+                return job_id, 0, "no_frames_extracted"
+                
         except Exception as e:
-            return job_id, 0, f"first_frame_error: {e}"
+            return job_id, 0, f"frame_extract_error: {e}"
 
-        # Compute embedding for the first frame
-        try:
-            embed_image_clip_to_npy(temp_frame_path, first_embed_path, model_id="openai/clip-vit-base-patch32")
-        except Exception as e:
-            return job_id, 1, f"embed_error: {e}"
-
-    return job_id, 1, None
+    return job_id, frames_extracted, None
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Batch download videos from CSV URLs, save only the first frame and its CLIP embedding")
+    parser = argparse.ArgumentParser(description="Batch download videos from CSV URLs, extract frames and create CLIP embeddings")
     parser.add_argument("--input", default="url-tvc.unique.csv", help="CSV path containing URLs (default: url-tvc.unique.csv)")
     parser.add_argument("--column", default="decoded_url", help="Column name containing URLs (default: decoded_url)")
     parser.add_argument("--out_dir", default="batch_outputs", help="Output directory for per-URL frames (default: batch_outputs)")
     parser.add_argument("--start", type=int, default=0, help="Start index (inclusive) in URL list (default: 0)")
     parser.add_argument("--end", type=int, default=None, help="End index (exclusive) in URL list (default: None)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing frames for a job")
+    parser.add_argument("--num_frames", type=int, default=3, choices=[1, 3], 
+                       help="Number of frames to extract: 1=fast (first only), 3=robust (first/middle/last, better for watermarks/crops) (default: 3)")
     args = parser.parse_args()
+
+    # Validate input file exists
+    if not os.path.isfile(args.input):
+        print(f"❌ ERROR: Input file not found: {args.input}", file=sys.stderr)
+        print(f"Please make sure the file exists before running this script.", file=sys.stderr)
+        sys.exit(1)
 
     ensure_dir(args.out_dir)
     urls = read_urls(args.input, args.column)
+    
+    if not urls:
+        print(f"❌ ERROR: No URLs found in {args.input}", file=sys.stderr)
+        print(f"Please check the file format and column name (current: '{args.column}').", file=sys.stderr)
+        sys.exit(1)
     if args.end is None or args.end > len(urls):
         end = len(urls)
     else:
@@ -159,13 +242,15 @@ def main() -> None:
         print("No URLs to process in the given range.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Processing URLs {start}..{end-1} out of {len(urls)} total (first frame only)")
+    mode_desc = "first frame only" if args.num_frames == 1 else "3 frames (first/middle/last) for better accuracy"
+    print(f"🎬 Processing URLs {start}..{end-1} out of {len(urls)} total")
+    print(f"📊 Mode: {mode_desc}")
     successes = 0
     failures = 0
     t0 = time.time()
     for i in range(start, end):
         url = urls[i]
-        job_id, num_frames, err = process_url(i, url, args.out_dir, args.overwrite)
+        job_id, num_frames, err = process_url(i, url, args.out_dir, args.overwrite, args.num_frames)
         if err:
             failures += 1
             print(f"[{i}] {job_id} FAIL ({err})")
@@ -174,7 +259,7 @@ def main() -> None:
             print(f"[{i}] {job_id} OK - {num_frames} frame(s)")
 
     dt = time.time() - t0
-    print(f"Done. OK={successes}, FAIL={failures}, elapsed={dt:.1f}s")
+    print(f"\n✅ Done. OK={successes}, FAIL={failures}, elapsed={dt:.1f}s")
 
 
 if __name__ == "__main__":

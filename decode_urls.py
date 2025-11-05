@@ -70,11 +70,17 @@ def main() -> None:
     args = parser.parse_args()
 
     if not os.path.isfile(args.input_path):
-        print(f"Input file not found: {args.input_path}", file=sys.stderr)
+        print(f"❌ ERROR: Input file not found: {args.input_path}", file=sys.stderr)
+        print(f"Please provide a valid CSV file containing URLs.", file=sys.stderr)
+        sys.exit(1)
+
+    # Check if output file would overwrite input
+    if os.path.abspath(args.input_path) == os.path.abspath(args.output_path):
+        print(f"❌ ERROR: Output file cannot be the same as input file!", file=sys.stderr)
         sys.exit(1)
 
     total = decode_file(args.input_path, args.output_path)
-    print(f"Decoded {total} row(s) → {args.output_path}")
+    print(f"✅ Successfully decoded {total} row(s) → {args.output_path}")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 __pycache__/
 .venv/
+venv/
 uploads/
 web_outputs/
 batch_outputs/

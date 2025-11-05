@@ -85,11 +85,17 @@ def main() -> None:
     args = parser.parse_args()
 
     if not os.path.isfile(args.input_path):
-        print(f"Input file not found: {args.input_path}", file=sys.stderr)
+        print(f"❌ ERROR: Input file not found: {args.input_path}", file=sys.stderr)
+        print(f"Please run decode_urls.py first to generate the decoded URL file.", file=sys.stderr)
+        sys.exit(1)
+
+    # Check if output files would overwrite input
+    if os.path.abspath(args.input_path) in [os.path.abspath(args.output_path), os.path.abspath(args.report_path)]:
+        print(f"❌ ERROR: Output files cannot be the same as input file!", file=sys.stderr)
         sys.exit(1)
 
     kept, removed = dedupe_file(args.input_path, args.output_path, args.report_path)
-    print(f"Kept {kept} unique URL(s), removed {removed} duplicate(s).")
+    print(f"✅ Successfully processed: kept {kept} unique URL(s), removed {removed} duplicate(s).")
     print(f"→ Unique: {args.output_path}\n→ Report: {args.report_path}")
 
 
