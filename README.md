@@ -104,11 +104,8 @@ python dedupe_urls.py --input tvcQc.decoded.csv --output tvcQc.unique.csv --repo
 # Bước 3: Upload trực tiếp lên Zilliz (extract + upload on-the-fly)
 python direct_upload_to_zilliz.py --input tvcQc.unique.csv --column decoded_url --collection video_dedup_direct --end 90000
 
-# Bước 4: Tìm duplicates từ Zilliz
-python search_duplicates_aggregated.py --collection video_dedup_direct --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv
-
-# Bước 5: Clean URLs
-python clean_final_urls.py FINAL_RESULT.csv FINAL_RESULT_CLEAN.csv invalid_urls.csv
+# Bước 4: Tìm duplicates + Auto-clean URLs (loại PNG, URLs lỗi)
+python search_duplicates_aggregated.py --collection video_dedup_direct --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv --auto_clean --invalid_csv invalid_urls.csv
 ```
 
 **🔥 Cách hoạt động của Direct Upload:**
@@ -124,9 +121,10 @@ Với mỗi video, script sẽ:
 **Ưu điểm:**
 - ✅ **Không cần batch_outputs** → Tiết kiệm GB disk space (0 GB cho 90k videos!)
 - ✅ **Nhanh hơn** → Extract xong upload ngay, không chờ hết
-- ✅ **Đơn giản** → Chỉ 5 bước thay vì 7 bước
+- ✅ **Đơn giản** → Chỉ **4 bước** thay vì 7 bước (gộp search + clean)
 - ✅ **Resume được** → Có thể dừng và tiếp tục với `--start` (ví dụ: `--start 5000 --end 10000`)
 - ✅ **Theo dõi tiến độ** → Hiển thị rate (videos/s) và ETA
+- ✅ **Auto-clean** → Tự động loại PNG/ảnh và URLs lỗi với flag `--auto_clean`
 
 **Ví dụ với 90k videos:**
 ```powershell
@@ -277,9 +275,13 @@ Upload: 1 vector per video (aggregated from 3 frames)
 
 ---
 
-### **Bước 6: Tìm duplicates từ Zilliz** 🎯
+### **Bước 6: Tìm duplicates + Auto-clean URLs** 🎯
 
 ```powershell
+# Với auto-clean (khuyến nghị - tự động loại PNG/ảnh và URLs lỗi)
+python search_duplicates_aggregated.py --collection video_dedup_v2 --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv --auto_clean --invalid_csv invalid_urls.csv
+
+# Hoặc không clean (để manual review sau)
 python search_duplicates_aggregated.py --collection video_dedup_v2 --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv
 ```
 
@@ -288,31 +290,18 @@ python search_duplicates_aggregated.py --collection video_dedup_v2 --cosine_thre
 - Search top-K similar vectors trên Zilliz (ANN search - O(log n))
 - So sánh cosine similarity
 - Nếu similarity ≥ threshold → duplicate
+- **✨ NEW:** Nếu dùng `--auto_clean`, tự động loại bỏ PNG/ảnh và URLs lỗi
 
 **Tham số:**
 - `--cosine_thresh 0.85`: Ngưỡng similarity (khuyến nghị: 0.85-0.90)
 - `--top_k 10`: Số candidates per query
+- `--auto_clean`: Tự động loại PNG/ảnh và URLs lỗi (optional)
+- `--invalid_csv`: File báo cáo URLs lỗi (default: invalid_urls.csv)
 
 **Output:**
-- `FINAL_RESULT.csv` (41 videos unique)
+- `FINAL_RESULT.csv` ⭐ **37 videos duy nhất (đã clean nếu dùng --auto_clean)**
 - `duplicates.csv` (416 videos trùng + similarity scores)
-
----
-
-### **Bước 7: Clean URLs (loại PNG, URLs lỗi)** 🧼
-
-```powershell
-python clean_final_urls.py FINAL_RESULT.csv FINAL_RESULT_CLEAN.csv invalid_urls.csv
-```
-
-**Loại bỏ:**
-- File ảnh (.png, .jpg)
-- URLs quá ngắn/lỗi
-- URLs không hợp lệ
-
-**Output:**
-- `FINAL_RESULT_CLEAN.csv` ⭐ **37 videos duy nhất (kết quả cuối cùng)**
-- `invalid_urls.csv` (4 URLs lỗi)
+- `invalid_urls.csv` (4 URLs lỗi - nếu dùng --auto_clean)
 
 ---
 
@@ -333,7 +322,7 @@ check_tvc/
 │   └── Collection: video_dedup_v2     (457 aggregated vectors)
 │
 └── ✅ FINAL OUTPUT
-    ├── FINAL_RESULT_CLEAN.csv         ⭐ 37 videos duy nhất
+    ├── FINAL_RESULT.csv               ⭐ 37 videos duy nhất (đã clean)
     ├── duplicates.csv                 (416 duplicates + scores)
     └── invalid_urls.csv               (4 invalid URLs)
 ```
@@ -362,12 +351,11 @@ python dedupe_urls.py --input tvcQc.decoded.csv --output tvcQc.unique.csv --repo
 # Bước 3: Upload trực tiếp lên Zilliz (không lưu local)
 python direct_upload_to_zilliz.py --input tvcQc.unique.csv --column decoded_url --collection video_dedup_direct --end 90000
 
-# Bước 4-5: Search & Clean
-python search_duplicates_aggregated.py --collection video_dedup_direct --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv
-python clean_final_urls.py FINAL_RESULT.csv FINAL_RESULT_CLEAN.csv invalid_urls.csv
+# Bước 4: Search + Auto-clean (gộp 2 bước cũ thành 1)
+python search_duplicates_aggregated.py --collection video_dedup_direct --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv --auto_clean --invalid_csv invalid_urls.csv
 
 # Xong! Xem kết quả:
-Get-Content FINAL_RESULT_CLEAN.csv
+Get-Content FINAL_RESULT.csv
 ```
 
 ---
@@ -384,13 +372,12 @@ python dedupe_urls.py --input tvcQc.decoded.csv --output tvcQc.unique.csv --repo
 python batch_extract_from_urls.py --input tvcQc.unique.csv --column decoded_url --out_dir batch_outputs
 python clean_empty_jobs.py --root batch_outputs
 
-# Bước 5-7: Upload & Search (Zilliz)
+# Bước 5-6: Upload & Search (Zilliz)
 python upload_to_milvus.py --root batch_outputs --collection video_dedup_simple
-python search_duplicates_aggregated.py --collection video_dedup_simple --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv
-python clean_final_urls.py FINAL_RESULT.csv FINAL_RESULT_CLEAN.csv invalid_urls.csv
+python search_duplicates_aggregated.py --collection video_dedup_simple --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv --auto_clean --invalid_csv invalid_urls.csv
 
 # Xong! Xem kết quả:
-Get-Content FINAL_RESULT_CLEAN.csv
+Get-Content FINAL_RESULT.csv
 ```
 
 ---
@@ -532,20 +519,21 @@ Scripts:
 ├── app.py
 ├── batch_extract_from_urls.py
 ├── clean_empty_jobs.py
-├── clean_final_urls.py
 ├── decode_urls.py
 ├── dedupe_urls.py
 ├── milvus_config.py
 ├── direct_upload_to_zilliz.py          ⭐⭐⭐ (khuyến nghị)
 ├── upload_to_milvus.py                 ⭐
 ├── upload_aggregated_to_milvus.py      ⭐
-├── search_duplicates_aggregated.py     ⭐
+├── search_duplicates_aggregated.py     ⭐ (tích hợp auto-clean)
 ├── test_milvus_connection.py
 └── requirements.txt
 
 Config:
 └── .env (hoặc environment variables)
 ```
+
+**Lưu ý:** `clean_final_urls.py` đã được **gộp vào** `search_duplicates_aggregated.py` với flag `--auto_clean`
 
 **Setup trong project mới:**
 ```powershell
@@ -763,7 +751,7 @@ Bạn đã có một hệ thống **production-ready** với:
 - 💾 `batch_extract_from_urls.py` - Extract và lưu local
 - ☁️ `upload_to_milvus.py` - Upload 1 frame per video
 - 🎯 `upload_aggregated_to_milvus.py` - Upload aggregated vectors (3 frames)
-- 🔍 `search_duplicates_aggregated.py` - Tìm duplicates
+- 🔍 `search_duplicates_aggregated.py` - Tìm duplicates + Auto-clean (tích hợp)
 
 **Happy coding! 🚀**
 
