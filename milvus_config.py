@@ -116,6 +116,9 @@ DEFAULT_SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.995"))
 DEFAULT_TOP_K = int(os.getenv("TOP_K", "10"))
 
 # Batch size for insert/search operations
+# 1000 = Nhanh, ít request, nhưng nếu crash mất tối đa 1000 vectors
+# 100 = Chậm hơn, nhưng an toàn hơn (chỉ mất tối đa 100 vectors nếu crash)
+# 10 = Upload liên tục (mỗi 10 videos), rất an toàn nhưng chậm
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
 
 # ============================================
