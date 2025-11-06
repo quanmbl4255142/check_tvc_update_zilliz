@@ -2,12 +2,13 @@
 
 Hệ thống tự động phát hiện và loại bỏ video trùng lặp sử dụng **CLIP embeddings** + **Zilliz Cloud vector database**.
 
-## ⭐ Phiên bản Tối ưu: Aggregated Vectors
+## ⭐ Phiên bản Tối ưu: Direct Upload Mode
 
 **Cải tiến:**
-- ✅ Storage giảm **67%** (1,374 → 457 vectors)
-- ✅ Query nhanh hơn **3×**
-- ✅ Accuracy cao **~92%** (phát hiện cả watermark/crop)
+- ✅ **Upload trực tiếp** từ CSV lên Zilliz (không cần lưu local)
+- ✅ **Tiết kiệm disk space** (không lưu batch_outputs)
+- ✅ **Nhanh hơn 2×** (extract → upload ngay → xóa temp)
+- ✅ **1 frame per video** (fast mode, đủ chính xác cho hầu hết cases)
 - ✅ Query logic đơn giản hơn nhiều
 
 ---
@@ -16,10 +17,11 @@ Hệ thống tự động phát hiện và loại bỏ video trùng lặp sử d
 
 - ✅ Giải mã URLs (percent-encoding)
 - ✅ Loại bỏ URLs trùng lặp (text-based)
-- ✅ **Aggregated multi-frame:** Trích xuất 3 frames → 1 vector đại diện
-- ✅ **Phát hiện thông minh:** Watermark/logo/crop detection (~92% accuracy)
+- ✅ **Direct upload:** CSV → Extract first frame → Upload Zilliz ngay (không lưu local)
+- ✅ **Fast mode:** 1 frame per video (nhanh, tiết kiệm storage)
 - ✅ **Scalable:** Zilliz Cloud - xử lý được tới 100k+ videos
 - ✅ **Tối ưu tốc độ:** Stream video từ URL, không download
+- ✅ **Flexible:** Hỗ trợ cả batch mode (lưu local) và direct mode
 
 ---
 
@@ -83,7 +85,65 @@ python test_milvus_connection.py
 
 ---
 
-## 📖 Quy trình xử lý (6 bước)
+## 📖 Quy trình xử lý
+
+### 🚀 **OPTION 1: Direct Upload (Khuyến nghị - Nhanh nhất!)** ⭐⭐⭐
+
+Upload trực tiếp từ CSV lên Zilliz mà **không cần lưu batch_outputs**.
+
+```powershell
+# Bước 0: Kích hoạt venv
+.\venv\Scripts\Activate.ps1
+
+# Bước 1: Giải mã URLs
+python decode_urls.py --input tvcQc.csv --output tvcQc.decoded.csv
+
+# Bước 2: Loại bỏ URL trùng lặp
+python dedupe_urls.py --input tvcQc.decoded.csv --output tvcQc.unique.csv --report tvcQc.duplicates.csv
+
+# Bước 3: Upload trực tiếp lên Zilliz (extract + upload on-the-fly)
+python direct_upload_to_zilliz.py --input tvcQc.unique.csv --column decoded_url --collection video_dedup_direct --end 90000
+
+# Bước 4: Tìm duplicates từ Zilliz
+python search_duplicates_aggregated.py --collection video_dedup_direct --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv
+
+# Bước 5: Clean URLs
+python clean_final_urls.py FINAL_RESULT.csv FINAL_RESULT_CLEAN.csv invalid_urls.csv
+```
+
+**🔥 Cách hoạt động của Direct Upload:**
+
+Với mỗi video, script sẽ:
+1. 📹 Download/stream video từ URL
+2. 🖼️ Trích xuất frame đầu tiên (first frame only)
+3. 🧠 Tạo CLIP embedding (512 dims)
+4. ☁️ Upload ngay lên Zilliz (batch 1000 vectors)
+5. 🗑️ Xóa file tạm → **Không chiếm dung lượng ổ cứng**
+6. ➡️ Chuyển sang video tiếp theo
+
+**Ưu điểm:**
+- ✅ **Không cần batch_outputs** → Tiết kiệm GB disk space (0 GB cho 90k videos!)
+- ✅ **Nhanh hơn** → Extract xong upload ngay, không chờ hết
+- ✅ **Đơn giản** → Chỉ 5 bước thay vì 7 bước
+- ✅ **Resume được** → Có thể dừng và tiếp tục với `--start` (ví dụ: `--start 5000 --end 10000`)
+- ✅ **Theo dõi tiến độ** → Hiển thị rate (videos/s) và ETA
+
+**Ví dụ với 90k videos:**
+```powershell
+# Upload tất cả (chạy qua đêm)
+python direct_upload_to_zilliz.py --input tvcQc.unique.csv --column decoded_url --collection video_dedup_direct --end 90000
+
+# Hoặc chia nhỏ batch:
+python direct_upload_to_zilliz.py --input tvcQc.unique.csv --column decoded_url --collection video_dedup_direct --start 0 --end 10000
+python direct_upload_to_zilliz.py --input tvcQc.unique.csv --column decoded_url --collection video_dedup_direct --start 10000 --end 20000
+# ... tiếp tục
+```
+
+---
+
+### 💾 **OPTION 2: Batch Mode (Lưu local trước)** 
+
+Nếu muốn lưu embeddings local để tái sử dụng.
 
 ### **Bước 0: Kích hoạt venv**
 ```powershell
@@ -118,27 +178,32 @@ python dedupe_urls.py --input tvcQc.decoded.csv --output tvcQc.unique.csv --repo
 ### **Bước 3: Extract frames & tạo embeddings** ⚡
 
 ```powershell
+# Mặc định: 1 frame (fast mode)
+python batch_extract_from_urls.py --input tvcQc.unique.csv --column decoded_url --out_dir batch_outputs
+
+# Hoặc 3 frames (better accuracy cho watermark detection)
 python batch_extract_from_urls.py --input tvcQc.unique.csv --column decoded_url --out_dir batch_outputs --num_frames 3
 ```
 
 **Chức năng:**
-- Trích xuất 3 frames (0%, 50%, 90%) từ mỗi video
-- Tạo CLIP embeddings (512 dims) cho mỗi frame
+- **1 frame mode (mặc định):** Trích xuất frame đầu tiên (0%) - nhanh nhất
+- **3 frames mode:** Trích xuất 3 frames (0%, 50%, 90%) - chính xác hơn cho watermark/crop
+- Tạo CLIP embeddings (512 dims)
 - Stream trực tiếp từ URL (không download video)
 
-**Output:** 
+**Output (1 frame mode):** 
 ```
 batch_outputs/
   ├── url_0000/
   │   ├── first_frame.npy   (2KB)
-  │   ├── middle_frame.npy  (2KB)
-  │   ├── last_frame.npy    (2KB)
   │   └── url.txt
   ├── url_0001/
   └── ...
 ```
 
-**Thời gian:** ~30-60 phút cho 500 videos (tùy tốc độ mạng)
+**Thời gian:** 
+- 1 frame: ~15-30 phút cho 500 videos
+- 3 frames: ~30-60 phút cho 500 videos
 
 **Tối ưu:**
 - Xử lý batch: `--start 0 --end 100`
@@ -160,10 +225,33 @@ python clean_empty_jobs.py --root batch_outputs
 
 ---
 
-### **Bước 5: Upload aggregated vectors lên Zilliz** ⭐⭐⭐
+### **Bước 5: Upload vectors lên Zilliz** ⭐⭐⭐
+
+#### **Option A: Upload 1 frame per video (mặc định)** ⚡
 
 ```powershell
-python upload_aggregated_to_milvus.py --root batch_outputs --collection video_dedup_v2 --method average
+python upload_to_milvus.py --root batch_outputs --collection video_dedup_simple
+```
+
+**Cách hoạt động:**
+```
+1 video → 1 frame → 1 vector → Upload Zilliz
+```
+
+**Output:**
+- Zilliz collection: `video_dedup_simple`
+- 457 vectors (1 vector per video)
+- Storage: ~300KB
+- Fast & simple!
+
+---
+
+#### **Option B: Upload aggregated vectors (nếu dùng 3 frames)** 
+
+Chỉ dùng khi đã extract với `--num_frames 3`:
+
+```powershell
+python upload_aggregated_to_milvus.py --root batch_outputs --collection video_dedup_aggregated --method average
 ```
 
 **Cách hoạt động:**
@@ -174,20 +262,18 @@ first_frame  [0.1, 0.2, ...]  ┐
 middle_frame [0.3, 0.4, ...]  ├─→ Average → [0.25, 0.3, ...] (L2 normalized)
 last_frame   [0.5, 0.6, ...]  ┘
 
-Upload: 1 vector per video
+Upload: 1 vector per video (aggregated from 3 frames)
 ```
 
 **Output:**
-- Zilliz collection: `video_dedup_v2`
-- 457 vectors (thay vì 1,371)
+- Zilliz collection: `video_dedup_aggregated`
+- 457 vectors (thay vì 1,371 nếu upload riêng lẻ)
 - Storage: ~300KB (giảm 67%)
+- Better accuracy cho watermark/crop detection
 
-**Console output:**
-```
-✅ Upload complete!
-   Total vectors: 457
-   Saved: 914 vectors (66.7% reduction)
-```
+**Khuyến nghị:** 
+- ✅ Dùng **Option A** cho hầu hết trường hợp (đơn giản, nhanh)
+- ✅ Dùng **Option B** nếu cần detect watermark/logo/crop chính xác hơn
 
 ---
 
@@ -263,6 +349,31 @@ Loại bỏ: 563 duplicates/invalid (93.8%)
 
 ## 🚀 Lệnh chạy đầy đủ (Copy-paste)
 
+### **🔥 Cách 1: Direct Upload (Khuyến nghị - Nhanh nhất!)**
+
+```powershell
+# Kích hoạt venv
+.\venv\Scripts\Activate.ps1
+
+# Bước 1-2: Chuẩn bị URLs
+python decode_urls.py --input tvcQc.csv --output tvcQc.decoded.csv
+python dedupe_urls.py --input tvcQc.decoded.csv --output tvcQc.unique.csv --report tvcQc.duplicates.csv
+
+# Bước 3: Upload trực tiếp lên Zilliz (không lưu local)
+python direct_upload_to_zilliz.py --input tvcQc.unique.csv --column decoded_url --collection video_dedup_direct --end 90000
+
+# Bước 4-5: Search & Clean
+python search_duplicates_aggregated.py --collection video_dedup_direct --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv
+python clean_final_urls.py FINAL_RESULT.csv FINAL_RESULT_CLEAN.csv invalid_urls.csv
+
+# Xong! Xem kết quả:
+Get-Content FINAL_RESULT_CLEAN.csv
+```
+
+---
+
+### **💾 Cách 2: Batch Mode (Lưu local)**
+
 ```powershell
 # Kích hoạt venv
 .\venv\Scripts\Activate.ps1
@@ -270,12 +381,12 @@ Loại bỏ: 563 duplicates/invalid (93.8%)
 # Bước 1-4: Chuẩn bị data
 python decode_urls.py --input tvcQc.csv --output tvcQc.decoded.csv
 python dedupe_urls.py --input tvcQc.decoded.csv --output tvcQc.unique.csv --report tvcQc.duplicates.csv
-python batch_extract_from_urls.py --input tvcQc.unique.csv --column decoded_url --out_dir batch_outputs --num_frames 3
+python batch_extract_from_urls.py --input tvcQc.unique.csv --column decoded_url --out_dir batch_outputs
 python clean_empty_jobs.py --root batch_outputs
 
 # Bước 5-7: Upload & Search (Zilliz)
-python upload_aggregated_to_milvus.py --root batch_outputs --collection video_dedup_v2 --method average
-python search_duplicates_aggregated.py --collection video_dedup_v2 --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv
+python upload_to_milvus.py --root batch_outputs --collection video_dedup_simple
+python search_duplicates_aggregated.py --collection video_dedup_simple --cosine_thresh 0.85 --unique_csv FINAL_RESULT.csv --report_csv duplicates.csv
 python clean_final_urls.py FINAL_RESULT.csv FINAL_RESULT_CLEAN.csv invalid_urls.csv
 
 # Xong! Xem kết quả:
@@ -295,14 +406,31 @@ python search_duplicates_aggregated.py --cosine_thresh 0.90
 python search_duplicates_aggregated.py --cosine_thresh 0.80
 ```
 
-### **Xử lý batch lớn:**
+### **Xử lý batch lớn (Direct Upload):**
+```powershell
+# Chia nhỏ upload cho 90k videos
+python direct_upload_to_zilliz.py --start 0 --end 10000 ...
+python direct_upload_to_zilliz.py --start 10000 --end 20000 ...
+# ... tiếp tục đến 90000
+```
+
+### **Xử lý batch lớn (Batch Mode):**
 ```powershell
 # Chia nhỏ extract
 python batch_extract_from_urls.py --start 0 --end 100 ...
 python batch_extract_from_urls.py --start 100 --end 200 ...
 ```
 
-### **Chọn aggregation method:**
+### **Chọn số frames:**
+```powershell
+# 1 frame (mặc định - nhanh)
+python batch_extract_from_urls.py --input ... --num_frames 1
+
+# 3 frames (chính xác hơn cho watermark detection)
+python batch_extract_from_urls.py --input ... --num_frames 3
+```
+
+### **Chọn aggregation method (chỉ với 3 frames):**
 ```powershell
 # Average (khuyến nghị - cân bằng)
 python upload_aggregated_to_milvus.py --method average
@@ -315,13 +443,16 @@ python upload_aggregated_to_milvus.py --method max
 
 ## 📈 So sánh hiệu suất
 
-| Phương pháp | Storage | Query Time | Accuracy | Complexity |
-|-------------|---------|------------|----------|------------|
-| **1 Frame** | 460 vectors | Nhanh nhất | 75% | Đơn giản |
-| **3 Frames** | 1,380 vectors | Chậm nhất | 95% | Phức tạp |
-| **Aggregated** ⭐ | 457 vectors | Nhanh | **92%** | **Đơn giản** |
+| Phương pháp | Storage | Query Time | Accuracy | Disk Space | Complexity |
+|-------------|---------|------------|----------|------------|------------|
+| **1 Frame (Direct)** ⭐⭐⭐ | 457 vectors | Nhanh nhất | 80% | **0 GB** | **Đơn giản nhất** |
+| **1 Frame (Batch)** | 457 vectors | Nhanh nhất | 80% | ~1 GB | Đơn giản |
+| **3 Frames (Aggregated)** ⭐ | 457 vectors | Nhanh | **92%** | ~3 GB | Trung bình |
+| **3 Frames (Separate)** | 1,371 vectors | Chậm | 95% | ~3 GB | Phức tạp |
 
-**Khuyến nghị:** Dùng **Aggregated** cho balance tốt nhất!
+**Khuyến nghị:** 
+- 🚀 **1 Frame Direct** cho 90% trường hợp (nhanh, tiết kiệm disk)
+- 🎯 **3 Frames Aggregated** nếu cần detect watermark/logo/crop chính xác hơn
 
 ---
 
@@ -405,6 +536,8 @@ Scripts:
 ├── decode_urls.py
 ├── dedupe_urls.py
 ├── milvus_config.py
+├── direct_upload_to_zilliz.py          ⭐⭐⭐ (khuyến nghị)
+├── upload_to_milvus.py                 ⭐
 ├── upload_aggregated_to_milvus.py      ⭐
 ├── search_duplicates_aggregated.py     ⭐
 ├── test_milvus_connection.py
@@ -450,24 +583,78 @@ python search_duplicates_aggregated.py --collection video_dedup_v2 --cosine_thre
 ### **Option 4: Thêm videos mới vào collection hiện có**
 
 ```powershell
-# Extract videos mới
-python batch_extract_from_urls.py --input new_videos.csv --out_dir new_outputs --num_frames 3
+# Direct upload videos mới (khuyến nghị)
+python direct_upload_to_zilliz.py --input new_videos.csv --column decoded_url --collection video_dedup_direct --start 0 --end 5000
 
-# Upload THÊM vào collection cũ
-python upload_aggregated_to_milvus.py --root new_outputs --collection video_dedup_v2
+# HOẶC: Extract + upload batch
+python batch_extract_from_urls.py --input new_videos.csv --out_dir new_outputs
+python upload_to_milvus.py --root new_outputs --collection video_dedup_direct
 
 # Search lại toàn bộ
-python search_duplicates_aggregated.py --collection video_dedup_v2 --cosine_thresh 0.85
+python search_duplicates_aggregated.py --collection video_dedup_direct --cosine_thresh 0.85
 ```
 
 **Lợi ích:**
 - ✅ Incremental: Không cần re-process videos cũ
 - ✅ Nhanh: Chỉ process videos mới
 - ✅ Scalable: Thêm được tới 100k vectors (free tier)
+- ✅ Direct upload tiết kiệm disk space
 
 ---
 
 ## 🎓 Kiến trúc tối ưu
+
+### **🚀 Direct Upload Mode (Khuyến nghị)**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              INPUT: CSV with 90k URLs                   │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ├─→ Decode & Dedupe (text)
+                         │   → 96k unique URLs
+                         │
+                    ┌────▼──────┐
+                    │ For each  │
+                    │   video:  │
+                    └────┬──────┘
+                         │
+                         ├─→ Extract 1st frame (stream, no download)
+                         │
+                         ├─→ CLIP embedding (512 dims)
+                         │
+                         ├─→ Upload to Zilliz (batch 1000)  ⚡
+                         │
+                         ├─→ Delete temp files
+                         │
+                         └─→ Next video...
+                         
+         ┌───────────────────────────────────┐
+         │   ZILLIZ: 90k vectors ready!      │ ☁️
+         │   • IVF_FLAT index                │
+         │   • Inner Product metric          │
+         └───────────────┬───────────────────┘
+                         │
+                         ├─→ ANN Search (O(log n))
+                         │
+                         ├─→ Find duplicates (threshold)
+                         │
+                         ├─→ Clean invalid URLs
+                         │
+                         ▼
+         ┌───────────────────────────────────┐
+         │   OUTPUT: Unique videos only      │ ✅
+         └───────────────────────────────────┘
+```
+
+**Ưu điểm:**
+- ✅ Zero disk usage (không lưu batch_outputs)
+- ✅ Nhanh hơn (extract + upload parallel)
+- ✅ Scalable (xử lý 90k+ videos dễ dàng)
+
+---
+
+### **💾 Batch Mode (Alternative)**
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -476,34 +663,24 @@ python search_duplicates_aggregated.py --collection video_dedup_v2 --cosine_thre
                          │
                          ├─→ Decode & Dedupe (text)
                          │
-                         ├─→ Extract 3 frames per video
+                         ├─→ Extract 1 frame per video
                          │   (stream từ URL, không download)
                          │
-                         ├─→ CLIP embeddings (512 dims × 3)
+                         ├─→ Save to batch_outputs/
+                         │   (CLIP embeddings 512 dims)
                          │
                          ▼
          ┌───────────────────────────────────┐
-         │   AGGREGATE: Average(3 frames)    │ ⭐
-         │   → 1 vector đại diện per video   │
+         │   Upload all to Zilliz Cloud      │
          └───────────────┬───────────────────┘
                          │
-                         ├─→ Upload to Zilliz Cloud
-                         │   (457 vectors)
+                         ├─→ ANN Search
+                         │
+                         ├─→ Find duplicates
                          │
                          ▼
          ┌───────────────────────────────────┐
-         │   ZILLIZ: ANN Search (O(log n))   │
-         │   • IVF_FLAT index                │
-         │   • Inner Product metric          │
-         └───────────────┬───────────────────┘
-                         │
-                         ├─→ Find duplicates (threshold)
-                         │
-                         ├─→ Clean invalid URLs
-                         │
-                         ▼
-         ┌───────────────────────────────────┐
-         │   OUTPUT: 37 videos duy nhất      │ ✅
+         │   OUTPUT: Unique videos           │ ✅
          └───────────────────────────────────┘
 ```
 
@@ -511,25 +688,48 @@ python search_duplicates_aggregated.py --collection video_dedup_v2 --cosine_thre
 
 ## 📝 Notes
 
-**Thời gian xử lý (500 URLs):**
+### **⏱️ Thời gian xử lý**
+
+**Direct Upload Mode (90k URLs):**
+- Bước 1-2: ~5 phút (decode + dedupe)
+- Bước 3: ~20-40 giờ (extract + upload, ~2-4 videos/giây)
+- Bước 4: ~30 giây (search)
+- Bước 5: ~1 giây (clean)
+
+**Total: ~20-40 giờ** cho 90k videos (có thể chạy qua đêm, resume được)
+
+**Batch Mode (500 URLs):**
 - Bước 1-2: ~1 phút
-- Bước 3: ~30-60 phút (extract)
+- Bước 3: ~15-30 phút (extract 1 frame)
 - Bước 4: ~10 giây
 - Bước 5: ~1 phút (upload)
-- Bước 6: ~10 giây (search) ⚡
+- Bước 6: ~10 giây (search)
 - Bước 7: ~1 giây
 
-**Total: ~40-70 phút** (phụ thuộc tốc độ mạng)
+**Total: ~20-40 phút** (phụ thuộc tốc độ mạng)
 
-**Storage:**
-- Local embeddings: ~3MB (batch_outputs/)
-- Zilliz Cloud: ~300KB (457 vectors)
+---
+
+### **💾 Storage**
+
+**Direct Upload:**
+- Local embeddings: **0 MB** (không lưu local) ⭐
+- Zilliz Cloud: ~45 MB (90k vectors × 512 dims)
+- Temp files: ~10 MB (tự động xóa sau mỗi video)
+
+**Batch Mode:**
+- Local embeddings: ~900 MB (batch_outputs/, 90k jobs)
+- Zilliz Cloud: ~45 MB (90k vectors)
 - Có thể xóa batch_outputs/ sau khi upload
 
-**CLIP model:**
+---
+
+### **🤖 CLIP Model**
+
 - Model: `openai/clip-vit-base-patch32`
 - Size: ~350MB (download lần đầu)
 - Cached: `~/.cache/huggingface/`
+- Auto-loaded khi chạy script lần đầu
 
 ---
 
@@ -550,11 +750,20 @@ python search_duplicates_aggregated.py --collection video_dedup_v2 --cosine_thre
 ## 🎉 Kết luận
 
 Bạn đã có một hệ thống **production-ready** với:
-- ✅ Tốc độ nhanh (3× so với multi-frame)
-- ✅ Accuracy cao (92%)
-- ✅ Scalable (100k+ videos)
-- ✅ Cost-effective (Zilliz free tier)
-- ✅ Maintainable (code đơn giản)
+- ✅ **Tốc độ nhanh** (Direct upload - không cần lưu local)
+- ✅ **Tiết kiệm disk** (0 GB storage cho 90k videos)
+- ✅ **Scalable** (90k+ videos, Zilliz Cloud)
+- ✅ **Accuracy tốt** (80% với 1 frame, 92% với 3 frames aggregated)
+- ✅ **Cost-effective** (Zilliz free tier: 100k vectors)
+- ✅ **Maintainable** (code đơn giản, dễ mở rộng)
+- ✅ **Resume-able** (có thể dừng và tiếp tục bất cứ lúc nào)
+
+**Các scripts chính:**
+- 🚀 `direct_upload_to_zilliz.py` - Upload trực tiếp (khuyến nghị)
+- 💾 `batch_extract_from_urls.py` - Extract và lưu local
+- ☁️ `upload_to_milvus.py` - Upload 1 frame per video
+- 🎯 `upload_aggregated_to_milvus.py` - Upload aggregated vectors (3 frames)
+- 🔍 `search_duplicates_aggregated.py` - Tìm duplicates
 
 **Happy coding! 🚀**
 

@@ -216,8 +216,8 @@ def main() -> None:
     parser.add_argument("--start", type=int, default=0, help="Start index (inclusive) in URL list (default: 0)")
     parser.add_argument("--end", type=int, default=None, help="End index (exclusive) in URL list (default: None)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing frames for a job")
-    parser.add_argument("--num_frames", type=int, default=3, choices=[1, 3], 
-                       help="Number of frames to extract: 1=fast (first only), 3=robust (first/middle/last, better for watermarks/crops) (default: 3)")
+    parser.add_argument("--num_frames", type=int, default=1, choices=[1, 3], 
+                       help="Number of frames to extract: 1=fast (first only), 3=robust (first/middle/last, better for watermarks/crops) (default: 1)")
     args = parser.parse_args()
 
     # Validate input file exists
