@@ -13,8 +13,10 @@ import csv
 import re
 import time
 import platform
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Tuple
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 import psutil
 from tqdm import tqdm
@@ -218,10 +220,16 @@ def search_duplicates_aggregated(
     auto_clean: bool = False,
     invalid_csv: str = None,
     enable_tracking: bool = True,
+    batch_size: int = 10,
+    num_threads: int = 4,
 ) -> tuple[int, int]:
     """
     Search duplicates với aggregated vectors - ĐƠN GIẢN HƠN NHIỀU!
     Mỗi video chỉ có 1 vector → không cần group frames
+    
+    ⚡ OPTIMIZED: Batch search + Parallel processing
+    - Batch size: Search nhiều videos cùng lúc (max 10 per Zilliz limit)
+    - Parallel: Nhiều threads chạy song song (tận dụng I/O wait)
     """
     if top_k is None:
         top_k = DEFAULT_TOP_K
@@ -303,7 +311,7 @@ def search_duplicates_aggregated(
                 break
         
         id_batch = collection.query(
-            expr="id >= 0",
+        expr="id >= 0",
             output_fields=["id"],
             limit=current_limit,
             offset=id_offset
@@ -370,7 +378,8 @@ def search_duplicates_aggregated(
         tracker.start_phase("Search duplicates")
     
     print(f"🎯 Searching for duplicates (threshold: {similarity_threshold})...")
-    print(f"📋 Using Two-Pass Algorithm for maximum accuracy\n")
+    print(f"📋 Using Two-Pass Algorithm for maximum accuracy")
+    print(f"⚡ OPTIMIZED: Batch size={batch_size}, Threads={num_threads}\n")
     
     # ============================================================
     # PASS 1: Find all duplicate pairs (without classification)
@@ -379,6 +388,7 @@ def search_duplicates_aggregated(
     
     # Store all duplicate pairs: (job_id1, job_id2, similarity)
     duplicate_pairs: List[tuple] = []
+    duplicate_pairs_lock = Lock()  # Thread-safe lock
     video_info: Dict[str, Dict] = {}  # job_id -> {url, embedding}
     
     # Build video info map
@@ -388,47 +398,93 @@ def search_duplicates_aggregated(
             "embedding": video["embedding"]
         }
     
-    # Use tqdm for progress bar
-    video_iterator = tqdm(all_data, desc="   Pass 1", unit="video") if tracker else all_data
-    
-    processed = 0
-    for video in video_iterator:
-        job_id = video["job_id"]
-        embedding = video["embedding"]
-        
-        processed += 1
-        
-        # Update resource stats periodically
-        if tracker and processed % 100 == 0:
-            tracker.update_stats()
+    # Helper function to search a batch of videos
+    def search_batch(batch_videos: List[Dict]) -> List[tuple]:
+        """Search a batch of videos and return duplicate pairs"""
+        batch_pairs = []
         
         try:
-            # Search similar videos
+            # Extract embeddings from batch
+            batch_embeddings = [v["embedding"] for v in batch_videos]
+            batch_job_ids = [v["job_id"] for v in batch_videos]
+            
+            # Batch search on Zilliz
             search_results = collection.search(
-                data=[embedding],
+                data=batch_embeddings,
                 anns_field="embedding",
                 param=SEARCH_PARAMS,
                 limit=top_k,
                 output_fields=["job_id", "url"]
             )
             
-            # Collect all pairs above threshold
-            for hit in search_results[0]:
-                hit_job_id = hit.entity.get("job_id")
-                
-                # Skip self
-                if hit_job_id == job_id:
-                    continue
-                
-                # Only add if similarity >= threshold
-                if hit.score >= similarity_threshold:
-                    # Add pair (normalize: always smaller job_id first to avoid duplicates)
-                    pair = tuple(sorted([job_id, hit_job_id])) + (hit.score,)
-                    duplicate_pairs.append(pair)
+            # Process results for each video in batch
+            for idx, (job_id, results) in enumerate(zip(batch_job_ids, search_results)):
+                for hit in results:
+                    hit_job_id = hit.entity.get("job_id")
+                    
+                    # Skip self
+                    if hit_job_id == job_id:
+                        continue
+                    
+                    # Only add if similarity >= threshold
+                    if hit.score >= similarity_threshold:
+                        # Add pair (normalize: always smaller job_id first to avoid duplicates)
+                        pair = tuple(sorted([job_id, hit_job_id])) + (hit.score,)
+                        batch_pairs.append(pair)
         
         except Exception as e:
-            print(f"⚠️  Error searching {job_id}: {e}")
-            continue
+            # Log error but continue with other batches
+            batch_ids_str = ", ".join([v["job_id"] for v in batch_videos[:3]])
+            print(f"⚠️  Error searching batch (first IDs: {batch_ids_str}...): {e}")
+        
+        return batch_pairs
+    
+    # Divide videos into batches
+    batches = []
+    for i in range(0, len(all_data), batch_size):
+        batch = all_data[i:i + batch_size]
+        batches.append(batch)
+    
+    total_batches = len(batches)
+    print(f"   📦 Divided into {total_batches} batches (batch size: {batch_size})")
+    print(f"   🚀 Starting parallel search with {num_threads} threads...\n")
+    
+    # Parallel batch search
+    processed_batches = 0
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        # Submit all batches
+        future_to_batch = {
+            executor.submit(search_batch, batch): batch 
+            for batch in batches
+        }
+        
+        # Process completed batches with progress bar
+        progress_bar = tqdm(total=total_batches, desc="   Pass 1", unit="batch") if tracker else None
+        
+        for future in as_completed(future_to_batch):
+            batch = future_to_batch[future]
+            processed_batches += 1
+            
+            try:
+                batch_pairs = future.result()
+                
+                # Thread-safe: Add pairs to global list
+                with duplicate_pairs_lock:
+                    duplicate_pairs.extend(batch_pairs)
+                
+                # Update progress
+                if progress_bar:
+                    progress_bar.update(1)
+                    if processed_batches % 10 == 0:
+                        tracker.update_stats() if tracker else None
+                elif processed_batches % 50 == 0:
+                    print(f"   📊 Processed {processed_batches}/{total_batches} batches...")
+            
+            except Exception as e:
+                print(f"⚠️  Error processing batch: {e}")
+        
+        if progress_bar:
+            progress_bar.close()
     
     # Remove duplicate pairs (same pair with different order)
     duplicate_pairs = list(set(duplicate_pairs))
@@ -502,7 +558,7 @@ def search_duplicates_aggregated(
                    (job_id1 == original_job_id and job_id2 == duplicate_job_id):
                     max_sim = max(max_sim, sim)
             
-            duplicates.append({
+                duplicates.append({
                 "duplicate_url": video_info[duplicate_job_id]["url"],
                 "duplicate_job_id": duplicate_job_id,
                 "original_job_id": original_job_id,
@@ -649,6 +705,18 @@ def main():
         help="Invalid URLs report (default: invalid_urls.csv)"
     )
     parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=10,
+        help="Batch size for parallel search (default: 10, max: 10 per Zilliz limit). Higher = faster but more memory"
+    )
+    parser.add_argument(
+        "--num_threads",
+        type=int,
+        default=4,
+        help="Number of parallel threads (default: 4). Higher = faster but more CPU"
+    )
+    parser.add_argument(
         "--config-only",
         action="store_true",
         help="Only print configuration"
@@ -660,12 +728,24 @@ def main():
         print(f"❌ ERROR: Threshold must be 0.0-1.0 (got {args.cosine_thresh})", file=sys.stderr)
         sys.exit(1)
     
+    if args.batch_size < 1 or args.batch_size > 10:
+        print(f"❌ ERROR: Batch size must be 1-10 (Zilliz limit, got {args.batch_size})", file=sys.stderr)
+        sys.exit(1)
+    
+    if args.num_threads < 1:
+        print(f"❌ ERROR: Number of threads must be >= 1 (got {args.num_threads})", file=sys.stderr)
+        sys.exit(1)
+    
     # Print config
     print_config()
     print(f"\n🎯 AGGREGATED MODE:")
     print(f"   → 1 vector per video (instead of 3)")
     print(f"   → 3× faster search")
     print(f"   → Simpler query logic")
+    print(f"\n⚡ OPTIMIZATION:")
+    print(f"   → Batch size: {args.batch_size} videos/batch")
+    print(f"   → Parallel threads: {args.num_threads}")
+    print(f"   → Expected speedup: {args.batch_size * args.num_threads}×")
     
     if args.config_only:
         return
@@ -679,7 +759,9 @@ def main():
             args.top_k,
             args.auto_clean,
             args.invalid_csv,
-            enable_tracking=True  # Always enable tracking
+            enable_tracking=True,  # Always enable tracking
+            batch_size=args.batch_size,
+            num_threads=args.num_threads
         )
         
         print(f"\n🎉 Search complete!")
