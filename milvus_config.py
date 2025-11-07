@@ -9,18 +9,20 @@ from typing import Optional
 # ============================================
 # ENVIRONMENT DETECTION
 # ============================================
-# Set USE_CLOUD=False in environment to use local Docker
-# Default: True (Zilliz Cloud - production ready)
-USE_CLOUD = os.getenv("USE_CLOUD", "True").lower() in ("true", "1", "yes")
+# Connection modes:
+# - "zilliz": Zilliz Cloud (URI + Token)
+# - "milvus": Milvus server with username/password
+# - "local": Local Docker (no auth)
+CONNECTION_MODE = os.getenv("MILVUS_MODE", "zilliz").lower()
 
 # ============================================
 # CONNECTION SETTINGS
 # ============================================
-if USE_CLOUD:
+if CONNECTION_MODE == "zilliz":
     # === PRODUCTION: Zilliz Cloud ===
     # Your Zilliz Cloud cluster endpoint (serverless format)
-    MILVUS_URI = os.getenv("MILVUS_URI", "https://in03-70f34bcdf458805.serverless.aws-eu-central-1.cloud.zilliz.com")
-    MILVUS_TOKEN = os.getenv("MILVUS_TOKEN", "72105e0290198f6770a148d6c89073da064d96c026e3c8cc6ce0864b8e82332fecdcaaeca1d65f666998784b70b63635fb74eb90")
+    MILVUS_URI = os.getenv("MILVUS_URI", "https://in03-3ff9d71801475b1.serverless.aws-eu-central-1.cloud.zilliz.com")
+    MILVUS_TOKEN = os.getenv("MILVUS_TOKEN", "e6422ff921d4cd92f89ea9181842360a7486b1ca8075a01ab3b988eeacf42844ff8efe5f99d93becc93353b00cc50a6c2e00fbfc")
     MILVUS_SECURE = True
     
     # Extract host from URI for backward compatibility
@@ -28,11 +30,27 @@ if USE_CLOUD:
     parsed = urlparse(MILVUS_URI)
     MILVUS_HOST = parsed.hostname
     MILVUS_PORT = parsed.port or 443
+    MILVUS_USER = None
+    MILVUS_PASSWORD = None
+    MILVUS_DB = None
+elif CONNECTION_MODE == "milvus":
+    # === MILVUS SERVER: Username/Password Authentication ===
+    MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus-ads.fptplay.net")
+    MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
+    MILVUS_USER = os.getenv("MILVUS_USER", "teamads1")
+    MILVUS_PASSWORD = os.getenv("MILVUS_PASSWORD", "6jvHA4QkfMruZNG9")
+    MILVUS_DB = os.getenv("MILVUS_DB", "test")
+    MILVUS_SECURE = os.getenv("MILVUS_SECURE", "False").lower() in ("true", "1", "yes")
+    MILVUS_URI = None
+    MILVUS_TOKEN = None
 else:
     # === DEVELOPMENT: Local Docker ===
     MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
     MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
     MILVUS_TOKEN = None
+    MILVUS_USER = None
+    MILVUS_PASSWORD = None
+    MILVUS_DB = None
     MILVUS_SECURE = False
     MILVUS_URI = None
 
@@ -132,13 +150,28 @@ CONSISTENCY_LEVEL = os.getenv("CONSISTENCY_LEVEL", "Strong")
 # ============================================
 def get_connection_params() -> dict:
     """Get connection parameters for pymilvus"""
-    if USE_CLOUD:
+    if CONNECTION_MODE == "zilliz":
         # For Zilliz Cloud serverless, use URI format
         return {
             "uri": MILVUS_URI,
             "token": MILVUS_TOKEN,
         }
+    elif CONNECTION_MODE == "milvus":
+        # For Milvus server with username/password
+        params = {
+            "host": MILVUS_HOST,
+            "port": str(MILVUS_PORT),
+        }
+        if MILVUS_USER and MILVUS_PASSWORD:
+            params["user"] = MILVUS_USER
+            params["password"] = MILVUS_PASSWORD
+        if MILVUS_DB:
+            params["db_name"] = MILVUS_DB
+        if MILVUS_SECURE:
+            params["secure"] = True
+        return params
     else:
+        # Local Docker (no auth)
         return {
             "host": MILVUS_HOST,
             "port": str(MILVUS_PORT),
@@ -150,14 +183,25 @@ def print_config():
     print("=" * 60)
     print("MILVUS CONFIGURATION")
     print("=" * 60)
-    print(f"Mode: {'☁️  CLOUD (Zilliz)' if USE_CLOUD else '💻 LOCAL (Docker)'}")
-    if USE_CLOUD:
+    
+    if CONNECTION_MODE == "zilliz":
+        print(f"Mode: ☁️  ZILLIZ CLOUD")
         print(f"URI: {MILVUS_URI}")
         token_preview = MILVUS_TOKEN[:20] + "..." if MILVUS_TOKEN else "NOT SET"
         print(f"Token: {token_preview}")
-    else:
+    elif CONNECTION_MODE == "milvus":
+        print(f"Mode: 🖥️  MILVUS SERVER")
         print(f"Host: {MILVUS_HOST}")
         print(f"Port: {MILVUS_PORT}")
+        print(f"User: {MILVUS_USER}")
+        print(f"Password: {'*' * len(MILVUS_PASSWORD) if MILVUS_PASSWORD else 'NOT SET'}")
+        print(f"Database: {MILVUS_DB}")
+        print(f"Secure: {MILVUS_SECURE}")
+    else:
+        print(f"Mode: 💻 LOCAL (Docker)")
+        print(f"Host: {MILVUS_HOST}")
+        print(f"Port: {MILVUS_PORT}")
+    
     print(f"Collection: {COLLECTION_NAME}")
     print(f"Embedding Dim: {EMBEDDING_DIM}")
     print(f"Index Type: {INDEX_TYPE}")
@@ -172,9 +216,12 @@ if __name__ == "__main__":
     print_config()
     
     # Validate
-    if USE_CLOUD and (not MILVUS_URI or not MILVUS_TOKEN):
-        print("\n⚠️  WARNING: USE_CLOUD=True but missing credentials!")
+    if CONNECTION_MODE == "zilliz" and (not MILVUS_URI or not MILVUS_TOKEN):
+        print("\n⚠️  WARNING: Zilliz mode but missing credentials!")
         print("Set MILVUS_URI and MILVUS_TOKEN in environment or .env file")
+    elif CONNECTION_MODE == "milvus" and (not MILVUS_USER or not MILVUS_PASSWORD):
+        print("\n⚠️  WARNING: Milvus mode but missing credentials!")
+        print("Set MILVUS_USER and MILVUS_PASSWORD in environment or .env file")
     else:
         print("\n✅ Configuration looks good!")
 

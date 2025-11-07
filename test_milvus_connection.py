@@ -5,7 +5,7 @@ Run this first to make sure everything is configured correctly!
 
 import sys
 from milvus_config import (
-    USE_CLOUD,
+    CONNECTION_MODE,
     get_connection_params,
     COLLECTION_NAME,
     EMBEDDING_DIM,
@@ -48,10 +48,15 @@ def test_connection():
     except Exception as e:
         print(f"   ❌ Connection failed: {e}")
         print("\n💡 Troubleshooting:")
-        if USE_CLOUD:
+        if CONNECTION_MODE == "zilliz":
             print("   1. Check MILVUS_URI and MILVUS_TOKEN in config")
             print("   2. Verify Zilliz Cloud cluster is running")
             print("   3. Check internet connection")
+        elif CONNECTION_MODE == "milvus":
+            print("   1. Check MILVUS_HOST, MILVUS_USER, MILVUS_PASSWORD in config")
+            print("   2. Verify VPN csoc is connected")
+            print("   3. Check hosts file has entry: 172.24.111.119 milvus-ads.fptplay.net")
+            print("   4. Ping test: ping milvus-ads.fptplay.net")
         else:
             print("   1. Make sure Milvus Docker container is running")
             print("   2. Run: docker-compose up -d")
@@ -86,12 +91,20 @@ def test_connection():
             print(f"   ✅ Collection exists!")
             print(f"   📊 Number of vectors: {num_entities}")
             if num_entities > 0:
-                # Get sample data
-                sample = collection.query(
-                    expr="id >= 0",
-                    limit=1,
-                    output_fields=["job_id", "url", "frame_type"]
-                )
+                # Get sample data (try with frame_type, fallback without)
+                try:
+                    sample = collection.query(
+                        expr="id >= 0",
+                        limit=1,
+                        output_fields=["job_id", "url", "frame_type"]
+                    )
+                except:
+                    # If frame_type doesn't exist (aggregated mode), try without it
+                    sample = collection.query(
+                        expr="id >= 0",
+                        limit=1,
+                        output_fields=["job_id", "url"]
+                    )
                 if sample:
                     print(f"   📝 Sample: {sample[0]}")
         else:
@@ -121,8 +134,16 @@ def test_connection():
         # Insert test vector
         import numpy as np
         test_vec = np.random.rand(EMBEDDING_DIM).astype(np.float32).tolist()
-        test_collection.insert([test_vec])
+        # Insert expects list of vectors: [[vec1], [vec2], ...]
+        test_collection.insert([[test_vec]])
         test_collection.flush()
+        
+        # Create index before loading
+        from milvus_config import INDEX_PARAMS
+        test_collection.create_index(
+            field_name="embedding",
+            index_params=INDEX_PARAMS
+        )
         
         # Search test
         test_collection.load()

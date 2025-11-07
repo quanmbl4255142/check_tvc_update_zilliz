@@ -20,7 +20,6 @@ from pymilvus import (
 )
 
 from milvus_config import (
-    USE_CLOUD,
     get_connection_params,
     EMBEDDING_DIM,
     MAX_URL_LENGTH,
