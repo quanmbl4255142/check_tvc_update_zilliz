@@ -32,6 +32,7 @@ from milvus_config import (
     DEFAULT_SIMILARITY_THRESHOLD,
     DEFAULT_TOP_K,
     SEARCH_PARAMS,
+    INDEX_TYPE,
     print_config,
 )
 
@@ -224,6 +225,7 @@ def search_duplicates_aggregated(
     num_threads: int = 4,
     chunk_start: int = None,
     chunk_end: int = None,
+    fast_mode: bool = False,
 ) -> tuple[int, int]:
     """
     Search duplicates với aggregated vectors - ĐƠN GIẢN HƠN NHIỀU!
@@ -274,59 +276,101 @@ def search_duplicates_aggregated(
     MAX_QUERY_LIMIT = 1500
     print(f"\n🔍 Fetching all videos from Zilliz (in batches of {MAX_QUERY_LIMIT})...")
     
-    # First, get all IDs (lightweight, no embeddings)
-    # Query in small batches to avoid offset+limit <= 16384 limit
-    print("   Step 1: Fetching all IDs...")
-    all_ids = []
-    id_offset = 0
-    id_batch_size = 10000  # Safe: offset + limit = 10000 < 16384
-    
-    while id_offset < total_entities:
-        remaining = total_entities - id_offset
-        current_limit = min(id_batch_size, remaining)
+    # Optimize: If chunk mode, only load IDs in range
+    if chunk_start is not None or chunk_end is not None:
+        start_idx = chunk_start if chunk_start is not None else 0
+        end_idx = chunk_end if chunk_end is not None else total_entities
+        start_idx = max(0, start_idx)
+        end_idx = min(total_entities, end_idx)
         
-        # Ensure offset + limit <= 16384
-        if id_offset + current_limit > 16384:
-            current_limit = 16384 - id_offset
-            if current_limit <= 0:
-                # Switch to ID range query
-                max_id_so_far = max(all_ids) if all_ids else -1
-                remaining_batch = collection.query(
-                    expr=f"id > {max_id_so_far}",
-                    output_fields=["id"],
-                    limit=16384
-                )
-                if remaining_batch:
-                    all_ids.extend([item["id"] for item in remaining_batch])
-                    # Continue with ID range
-                    while len(remaining_batch) == 16384:
-                        new_max = max([item["id"] for item in remaining_batch])
-                        remaining_batch = collection.query(
-                            expr=f"id > {new_max}",
-                            output_fields=["id"],
-                            limit=16384
-                        )
-                        if remaining_batch:
-                            all_ids.extend([item["id"] for item in remaining_batch])
-                        else:
-                            break
+        print(f"📦 CHUNK MODE: Will only load videos {start_idx} to {end_idx-1} ({end_idx - start_idx} videos)")
+        print(f"   Step 1: Fetching IDs in range...")
+        
+        # Fetch IDs in chunk range using offset/limit
+        all_ids = []
+        id_offset = start_idx
+        id_batch_size = 10000  # Safe: offset + limit = 10000 < 16384
+        target_count = end_idx - start_idx
+        
+        while id_offset < end_idx and len(all_ids) < target_count:
+            remaining = end_idx - id_offset
+            current_limit = min(id_batch_size, remaining)
+            
+            # Ensure offset + limit <= 16384
+            if id_offset + current_limit > 16384:
+                current_limit = 16384 - id_offset
+                if current_limit <= 0:
+                    break
+            
+            id_batch = collection.query(
+                expr="id >= 0",
+                output_fields=["id"],
+                limit=current_limit,
+                offset=id_offset
+            )
+            if not id_batch:
+                break
+            all_ids.extend([item["id"] for item in id_batch])
+            id_offset += len(id_batch)
+            
+            if len(id_batch) < current_limit:
                 break
         
-        id_batch = collection.query(
-        expr="id >= 0",
-            output_fields=["id"],
-            limit=current_limit,
-            offset=id_offset
-        )
-        if not id_batch:
-            break
-        all_ids.extend([item["id"] for item in id_batch])
-        id_offset += len(id_batch)
+        print(f"   ✅ Found {len(all_ids)} IDs in chunk range")
+    else:
+        # Load all IDs (full mode)
+        print("   Step 1: Fetching all IDs...")
+        all_ids = []
+        id_offset = 0
+        id_batch_size = 10000  # Safe: offset + limit = 10000 < 16384
         
-        if len(id_batch) < current_limit:
-            break
+        while id_offset < total_entities:
+            remaining = total_entities - id_offset
+            current_limit = min(id_batch_size, remaining)
+            
+            # Ensure offset + limit <= 16384
+            if id_offset + current_limit > 16384:
+                current_limit = 16384 - id_offset
+                if current_limit <= 0:
+                    # Switch to ID range query
+                    max_id_so_far = max(all_ids) if all_ids else -1
+                    remaining_batch = collection.query(
+                        expr=f"id > {max_id_so_far}",
+                        output_fields=["id"],
+                        limit=16384
+                    )
+                    if remaining_batch:
+                        all_ids.extend([item["id"] for item in remaining_batch])
+                        # Continue with ID range
+                        while len(remaining_batch) == 16384:
+                            new_max = max([item["id"] for item in remaining_batch])
+                            remaining_batch = collection.query(
+                                expr=f"id > {new_max}",
+                                output_fields=["id"],
+                                limit=16384
+                            )
+                            if remaining_batch:
+                                all_ids.extend([item["id"] for item in remaining_batch])
+                            else:
+                                break
+                    break
+            
+            id_batch = collection.query(
+                expr="id >= 0",
+                output_fields=["id"],
+                limit=current_limit,
+                offset=id_offset
+            )
+            if not id_batch:
+                break
+            all_ids.extend([item["id"] for item in id_batch])
+            id_offset += len(id_batch)
+            
+            if len(id_batch) < current_limit:
+                break
+        
+        print(f"   ✅ Found {len(all_ids)} IDs")
     
-    print(f"   ✅ Found {len(all_ids)} IDs")
     print(f"   Step 2: Fetching embeddings in batches...")
     
     # Now query embeddings by ID ranges
@@ -375,25 +419,16 @@ def search_duplicates_aggregated(
     
     print(f"✅ Loaded {len(all_data)} videos total")
     
-    # Apply chunk filtering if specified
-    original_count = len(all_data)
-    if chunk_start is not None or chunk_end is not None:
-        start_idx = chunk_start if chunk_start is not None else 0
-        end_idx = chunk_end if chunk_end is not None else len(all_data)
-        start_idx = max(0, start_idx)
-        end_idx = min(len(all_data), end_idx)
-        
-        all_data = all_data[start_idx:end_idx]
-        print(f"📦 CHUNK MODE: Processing videos {start_idx} to {end_idx-1} ({len(all_data)} videos)")
-        print(f"   (Skipped {start_idx} videos at start, {original_count - end_idx} videos at end)")
-    
     if tracker:
         tracker.end_phase()
         tracker.start_phase("Search duplicates")
     
     print(f"🎯 Searching for duplicates (threshold: {similarity_threshold})...")
     print(f"📋 Using Two-Pass Algorithm for maximum accuracy")
-    print(f"⚡ OPTIMIZED: Batch size={batch_size}, Threads={num_threads}\n")
+    print(f"⚡ OPTIMIZED: Batch size={batch_size}, Threads={num_threads}")
+    if fast_mode:
+        print(f"⚡ FAST MODE: Using optimized search params for 2-4x speedup")
+    print()
     
     # ============================================================
     # PASS 1: Find all duplicate pairs (without classification)
@@ -412,8 +447,18 @@ def search_duplicates_aggregated(
             "embedding": video["embedding"]
         }
     
+    # OPTIMIZATION: Use faster search params if fast_mode
+    # Lower nprobe = faster but slightly less accurate
+    fast_search_params = SEARCH_PARAMS.copy()
+    if INDEX_TYPE == "IVF_FLAT":
+        # Reduce nprobe for speed (default 16 -> 8 for 2x speed, 4 for 4x speed)
+        fast_search_params["params"]["nprobe"] = 8
+    elif INDEX_TYPE == "HNSW":
+        # Reduce ef for speed (default 64 -> 32 for 2x speed)
+        fast_search_params["params"]["ef"] = 32
+    
     # Helper function to search a batch of videos
-    def search_batch(batch_videos: List[Dict]) -> List[tuple]:
+    def search_batch(batch_videos: List[Dict], use_fast: bool = False) -> List[tuple]:
         """Search a batch of videos and return duplicate pairs"""
         batch_pairs = []
         
@@ -422,11 +467,14 @@ def search_duplicates_aggregated(
             batch_embeddings = [v["embedding"] for v in batch_videos]
             batch_job_ids = [v["job_id"] for v in batch_videos]
             
+            # Choose search params based on mode
+            search_params = fast_search_params if use_fast else SEARCH_PARAMS
+            
             # Batch search on Zilliz
             search_results = collection.search(
                 data=batch_embeddings,
                 anns_field="embedding",
-                param=SEARCH_PARAMS,
+                param=search_params,
                 limit=top_k,
                 output_fields=["job_id", "url"]
             )
@@ -440,10 +488,19 @@ def search_duplicates_aggregated(
                     if hit_job_id == job_id:
                         continue
                     
+                    # IMPROVEMENT 5: Validate similarity score
+                    # For IP metric, score should be in range [0, 1] for normalized vectors
+                    # But due to floating point precision, can be slightly > 1.0
+                    score = float(hit.score)
+                    if score > 1.1:  # Sanity check: if way too high, skip
+                        continue
+                    # Clamp to [0, 1] for safety
+                    score = max(0.0, min(1.0, score))
+                    
                     # Only add if similarity >= threshold
-                    if hit.score >= similarity_threshold:
+                    if score >= similarity_threshold:
                         # Add pair (normalize: always smaller job_id first to avoid duplicates)
-                        pair = tuple(sorted([job_id, hit_job_id])) + (hit.score,)
+                        pair = tuple(sorted([job_id, hit_job_id])) + (score,)
                         batch_pairs.append(pair)
         
         except Exception as e:
@@ -466,9 +523,9 @@ def search_duplicates_aggregated(
     # Parallel batch search
     processed_batches = 0
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        # Submit all batches
+        # Submit all batches (use fast_mode if enabled)
         future_to_batch = {
-            executor.submit(search_batch, batch): batch 
+            executor.submit(search_batch, batch, fast_mode): batch 
             for batch in batches
         }
         
@@ -509,7 +566,7 @@ def search_duplicates_aggregated(
     # ============================================================
     print(f"\n🔗 PASS 2: Grouping into clusters and selecting originals...")
     
-    # Filter duplicate pairs: Only keep pairs where BOTH videos are in current chunk
+    # Separate within-chunk and cross-chunk pairs
     all_job_ids = set(video_info.keys())
     chunk_duplicate_pairs = [
         (job_id1, job_id2, similarity) 
@@ -517,55 +574,135 @@ def search_duplicates_aggregated(
         if job_id1 in all_job_ids and job_id2 in all_job_ids
     ]
     
-    cross_chunk_pairs = len(duplicate_pairs) - len(chunk_duplicate_pairs)
-    if cross_chunk_pairs > 0:
-        print(f"   📊 Filtered: {len(chunk_duplicate_pairs)} pairs within chunk, {cross_chunk_pairs} cross-chunk pairs (will be handled in merge step)")
+    cross_chunk_pairs_list = [
+        (job_id1, job_id2, similarity) 
+        for job_id1, job_id2, similarity in duplicate_pairs
+        if not (job_id1 in all_job_ids and job_id2 in all_job_ids)
+    ]
     
+    cross_chunk_pairs_count = len(cross_chunk_pairs_list)
+    if cross_chunk_pairs_count > 0:
+        print(f"   📊 Found: {len(chunk_duplicate_pairs)} pairs within chunk, {cross_chunk_pairs_count} cross-chunk pairs")
+    
+    # ============================================================
+    # IMPROVEMENT 1: Handle cross-chunk pairs immediately
+    # ============================================================
+    # Track videos that should be marked as duplicates due to cross-chunk pairs
+    # If a video in current chunk has a duplicate with smaller job_id in another chunk,
+    # mark it as duplicate
+    cross_chunk_duplicates: Set[str] = set()
+    cross_chunk_originals: Dict[str, Tuple[str, float]] = {}  # job_id -> (original_job_id, similarity)
+    
+    for job_id1, job_id2, similarity in cross_chunk_pairs_list:
+        # Determine which is original (smaller job_id)
+        if job_id1 < job_id2:
+            original_id, duplicate_id = job_id1, job_id2
+        else:
+            original_id, duplicate_id = job_id2, job_id1
+        
+        # If duplicate is in current chunk and original is outside
+        if duplicate_id in all_job_ids and original_id not in all_job_ids:
+            cross_chunk_duplicates.add(duplicate_id)
+            # Store the best similarity for this duplicate
+            if duplicate_id not in cross_chunk_originals or similarity > cross_chunk_originals[duplicate_id][1]:
+                cross_chunk_originals[duplicate_id] = (original_id, similarity)
+    
+    if cross_chunk_duplicates:
+        print(f"   🔗 Marked {len(cross_chunk_duplicates)} videos as duplicates (original in other chunk)")
+    
+    # ============================================================
+    # Build graph for within-chunk clustering
+    # ============================================================
+    print(f"   🔧 Building graph from {len(chunk_duplicate_pairs)} pairs...")
     # Build graph: job_id -> set of connected job_ids
     graph: Dict[str, Set[str]] = {}
     
-    # Initialize graph
+    # Initialize graph (exclude cross-chunk duplicates from clustering)
     for job_id in all_job_ids:
-        graph[job_id] = set()
+        if job_id not in cross_chunk_duplicates:
+            graph[job_id] = set()
     
-    # Add edges from duplicate pairs (only within chunk)
+    # Add edges from duplicate pairs (only within chunk, exclude cross-chunk duplicates)
+    edges_added = 0
     for job_id1, job_id2, similarity in chunk_duplicate_pairs:
         if job_id1 in graph and job_id2 in graph:
             graph[job_id1].add(job_id2)
             graph[job_id2].add(job_id1)
+            edges_added += 1
+    print(f"   ✅ Built graph with {len(graph)} nodes and ~{edges_added} edges")
     
-    # Find connected components (clusters) using DFS
+    # Find connected components (clusters) using iterative DFS (avoid recursion limit)
     visited: Set[str] = set()
     clusters: List[Set[str]] = []
     
-    def dfs(node: str, cluster: Set[str]):
-        """Depth-first search to find connected component"""
-        if node in visited:
-            return
-        visited.add(node)
-        cluster.add(node)
-        for neighbor in graph[node]:
-            dfs(neighbor, cluster)
+    def dfs_iterative(start_node: str) -> Set[str]:
+        """Iterative DFS to find connected component (avoid recursion limit)"""
+        if start_node in visited:
+            return set()
+        
+        cluster = set()
+        stack = [start_node]
+        
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            
+            visited.add(node)
+            cluster.add(node)
+            
+            # Add all neighbors to stack
+            for neighbor in graph.get(node, set()):
+                if neighbor not in visited:
+                    stack.append(neighbor)
+        
+        return cluster
     
     # Find all clusters
+    print(f"   🔍 Finding connected components (clusters)...")
     for job_id in all_job_ids:
-        if job_id not in visited:
-            cluster = set()
-            dfs(job_id, cluster)
+        if job_id not in visited and job_id not in cross_chunk_duplicates:
+            cluster = dfs_iterative(job_id)
             if cluster:
                 clusters.append(cluster)
+                if len(clusters) % 10 == 0:
+                    print(f"      Found {len(clusters)} clusters so far...")
     
-    print(f"   ✅ Found {len(clusters)} clusters")
+    print(f"   ✅ Found {len(clusters)} clusters (excluding cross-chunk duplicates)")
     
-    # Select original for each cluster (first video in cluster)
+    # ============================================================
+    # IMPROVEMENT 2: Select original based on smallest job_id in entire collection
+    # ============================================================
     originals: Set[str] = set()
     duplicates: List[Dict] = []
     unique_videos: List[Dict] = []
     
+    # Track all videos that are in clusters
+    videos_in_clusters: Set[str] = set()
     for cluster in clusters:
-        # Sort cluster to ensure deterministic selection
+        videos_in_clusters.update(cluster)
+    
+    # OPTIMIZATION: Build similarity lookup dictionary for O(1) lookup
+    # Instead of searching through 8M pairs, use a dict: (job_id1, job_id2) -> similarity
+    print(f"   🔧 Building similarity lookup dictionary...")
+    similarity_lookup: Dict[Tuple[str, str], float] = {}
+    for job_id1, job_id2, sim in chunk_duplicate_pairs:
+        # Normalize: always smaller job_id first for consistent lookup
+        key = tuple(sorted([job_id1, job_id2]))
+        # Keep highest similarity if multiple pairs exist
+        if key not in similarity_lookup or sim > similarity_lookup[key]:
+            similarity_lookup[key] = sim
+    print(f"   ✅ Built lookup dict with {len(similarity_lookup)} entries")
+    
+    # Process clusters with progress tracking
+    print(f"   🔄 Processing {len(clusters)} clusters...")
+    for cluster_idx, cluster in enumerate(clusters):
+        if (cluster_idx + 1) % 10 == 0 or cluster_idx == 0:
+            print(f"      Processing cluster {cluster_idx + 1}/{len(clusters)} (size: {len(cluster)})")
+        
+        # IMPROVEMENT: Sort by job_id to get smallest (will be consistent across chunks)
         sorted_cluster = sorted(cluster)
-        original_job_id = sorted_cluster[0]  # First video = original
+        original_job_id = sorted_cluster[0]  # Smallest job_id = original
         originals.add(original_job_id)
         
         # Add original to unique videos
@@ -576,13 +713,9 @@ def search_duplicates_aggregated(
         
         # Add all others as duplicates
         for duplicate_job_id in sorted_cluster[1:]:
-            # Find similarity between duplicate and original
-            # (use the pair with highest similarity if multiple paths exist)
-            max_sim = 0.0
-            for job_id1, job_id2, sim in chunk_duplicate_pairs:
-                if (job_id1 == duplicate_job_id and job_id2 == original_job_id) or \
-                   (job_id1 == original_job_id and job_id2 == duplicate_job_id):
-                    max_sim = max(max_sim, sim)
+            # OPTIMIZATION: Use lookup dict instead of searching through all pairs
+            key = tuple(sorted([duplicate_job_id, original_job_id]))
+            max_sim = similarity_lookup.get(key, 0.0)
             
             duplicates.append({
                 "duplicate_url": video_info[duplicate_job_id]["url"],
@@ -592,45 +725,32 @@ def search_duplicates_aggregated(
                 "similarity": f"{max_sim:.6f}" if max_sim > 0 else "0.000000"
             })
     
-    # Handle cross-chunk duplicates: If video in chunk duplicates with video outside chunk,
-    # mark the video in chunk as duplicate (will be handled when processing the other chunk)
-    cross_chunk_duplicates = []
-    for job_id1, job_id2, similarity in duplicate_pairs:
-        if job_id1 in all_job_ids and job_id2 not in all_job_ids:
-            # job_id1 in chunk, job_id2 outside chunk
-            cross_chunk_duplicates.append({
-                "duplicate_url": video_info[job_id1]["url"],
-                "duplicate_job_id": job_id1,
-                "original_job_id": job_id2,
-                "original_url": f"(outside chunk, index > {chunk_end if chunk_end else 'unknown'})",
-                "similarity": f"{similarity:.6f}",
-                "note": "cross-chunk"
+    # BUG FIX: Add videos that have no duplicates (not in any cluster and not cross-chunk duplicate)
+    standalone_videos = all_job_ids - videos_in_clusters - cross_chunk_duplicates
+    if standalone_videos:
+        print(f"   ℹ️  Found {len(standalone_videos)} standalone videos (no duplicates)")
+        for job_id in sorted(standalone_videos):
+            unique_videos.append({
+                "url": video_info[job_id]["url"],
+                "job_id": job_id
             })
-            # Remove from unique videos if it was added
-            unique_videos = [v for v in unique_videos if v["job_id"] != job_id1]
-            if job_id1 in originals:
-                originals.remove(job_id1)
-        elif job_id2 in all_job_ids and job_id1 not in all_job_ids:
-            # job_id2 in chunk, job_id1 outside chunk
-            cross_chunk_duplicates.append({
-                "duplicate_url": video_info[job_id2]["url"],
-                "duplicate_job_id": job_id2,
-                "original_job_id": job_id1,
-                "original_url": f"(outside chunk, index < {chunk_start if chunk_start else 'unknown'})",
-                "similarity": f"{similarity:.6f}",
-                "note": "cross-chunk"
-            })
-            # Remove from unique videos if it was added
-            unique_videos = [v for v in unique_videos if v["job_id"] != job_id2]
-            if job_id2 in originals:
-                originals.remove(job_id2)
+            originals.add(job_id)
+    else:
+        print(f"   ℹ️  No standalone videos (all {len(all_job_ids)} videos have duplicates)")
     
-    if cross_chunk_duplicates:
-        print(f"   ⚠️  Found {len(cross_chunk_duplicates)} cross-chunk duplicates (will be resolved in merge step)")
-        # Add to duplicates list
-        duplicates.extend(cross_chunk_duplicates)
+    # Add cross-chunk duplicates to duplicates list
+    for duplicate_job_id in cross_chunk_duplicates:
+        original_job_id, similarity = cross_chunk_originals[duplicate_job_id]
+        duplicates.append({
+            "duplicate_url": video_info[duplicate_job_id]["url"],
+            "duplicate_job_id": duplicate_job_id,
+            "original_job_id": original_job_id,
+            "original_url": f"[CROSS-CHUNK: {original_job_id}]",  # Mark as cross-chunk
+            "similarity": f"{similarity:.6f}"
+        })
     
-    print(f"   ✅ Selected {len(originals)} originals, {len(duplicates)} duplicates")
+    within_chunk_duplicates = len(duplicates) - len(cross_chunk_duplicates)
+    print(f"   ✅ Selected {len(originals)} originals, {within_chunk_duplicates} within-chunk duplicates, {len(cross_chunk_duplicates)} cross-chunk duplicates")
     
     if tracker:
         tracker.end_phase()
@@ -781,6 +901,11 @@ def main():
         help="Number of parallel threads (default: 4). Higher = faster but more CPU"
     )
     parser.add_argument(
+        "--fast_mode",
+        action="store_true",
+        help="Fast mode: Use optimized search params (lower nprobe/ef) for 2-4x speedup. Slightly less accurate."
+    )
+    parser.add_argument(
         "--chunk_start",
         type=int,
         default=None,
@@ -875,7 +1000,8 @@ def main():
             batch_size=args.batch_size,
             num_threads=args.num_threads,
             chunk_start=args.chunk_start,
-            chunk_end=args.chunk_end
+            chunk_end=args.chunk_end,
+            fast_mode=args.fast_mode
         )
         
         print(f"\n🎉 Search complete!")
