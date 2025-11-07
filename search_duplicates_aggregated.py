@@ -256,15 +256,114 @@ def search_duplicates_aggregated(
     print(f"📊 Collection has {total_entities} vectors")
     print(f"🎯 Each video = 1 vector (aggregated from 3 frames)")
     
-    # Get all videos
-    print(f"\n🔍 Fetching all videos from Zilliz...")
-    all_data = collection.query(
-        expr="id >= 0",
-        output_fields=["job_id", "url", "embedding"],
-        limit=total_entities
-    )
+    # Get all videos - Query in batches using ID range (avoid offset+limit limit)
+    # Note: gRPC message size limit is ~4MB
+    # Each vector: 512 dims × 4 bytes = 2KB
+    # Safe batch size: ~1500 vectors (3MB) to stay under 4MB limit
+    # Also: Zilliz limit: offset + limit <= 16384, so we use ID range instead
+    MAX_QUERY_LIMIT = 1500
+    print(f"\n🔍 Fetching all videos from Zilliz (in batches of {MAX_QUERY_LIMIT})...")
     
-    print(f"✅ Loaded {len(all_data)} videos")
+    # First, get all IDs (lightweight, no embeddings)
+    # Query in small batches to avoid offset+limit <= 16384 limit
+    print("   Step 1: Fetching all IDs...")
+    all_ids = []
+    id_offset = 0
+    id_batch_size = 10000  # Safe: offset + limit = 10000 < 16384
+    
+    while id_offset < total_entities:
+        remaining = total_entities - id_offset
+        current_limit = min(id_batch_size, remaining)
+        
+        # Ensure offset + limit <= 16384
+        if id_offset + current_limit > 16384:
+            current_limit = 16384 - id_offset
+            if current_limit <= 0:
+                # Switch to ID range query
+                max_id_so_far = max(all_ids) if all_ids else -1
+                remaining_batch = collection.query(
+                    expr=f"id > {max_id_so_far}",
+                    output_fields=["id"],
+                    limit=16384
+                )
+                if remaining_batch:
+                    all_ids.extend([item["id"] for item in remaining_batch])
+                    # Continue with ID range
+                    while len(remaining_batch) == 16384:
+                        new_max = max([item["id"] for item in remaining_batch])
+                        remaining_batch = collection.query(
+                            expr=f"id > {new_max}",
+                            output_fields=["id"],
+                            limit=16384
+                        )
+                        if remaining_batch:
+                            all_ids.extend([item["id"] for item in remaining_batch])
+                        else:
+                            break
+                break
+        
+        id_batch = collection.query(
+            expr="id >= 0",
+            output_fields=["id"],
+            limit=current_limit,
+            offset=id_offset
+        )
+        if not id_batch:
+            break
+        all_ids.extend([item["id"] for item in id_batch])
+        id_offset += len(id_batch)
+        
+        if len(id_batch) < current_limit:
+            break
+    
+    print(f"   ✅ Found {len(all_ids)} IDs")
+    print(f"   Step 2: Fetching embeddings in batches...")
+    
+    # Now query embeddings by ID ranges
+    all_data = []
+    batch_num = 1
+    
+    for i in range(0, len(all_ids), MAX_QUERY_LIMIT):
+        batch_ids = all_ids[i:i + MAX_QUERY_LIMIT]
+        
+        if tracker:
+            tracker.update_stats()
+        
+        try:
+            # Query by ID list (more efficient than offset)
+            id_list_str = ",".join([str(id_val) for id_val in batch_ids])
+            batch_data = collection.query(
+                expr=f"id in [{id_list_str}]",
+                output_fields=["job_id", "url", "embedding"]
+            )
+        except Exception as e:
+            # If ID list too large, query in smaller chunks
+            if "message larger than max" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or len(batch_ids) > 1000:
+                print(f"   ⚠️  Batch too large, splitting...")
+                # Split into smaller chunks
+                chunk_size = 500
+                batch_data = []
+                for j in range(0, len(batch_ids), chunk_size):
+                    chunk_ids = batch_ids[j:j + chunk_size]
+                    chunk_id_str = ",".join([str(id_val) for id_val in chunk_ids])
+                    chunk_data = collection.query(
+                        expr=f"id in [{chunk_id_str}]",
+                        output_fields=["job_id", "url", "embedding"]
+                    )
+                    batch_data.extend(chunk_data)
+            else:
+                raise
+        
+        all_data.extend(batch_data)
+        
+        print(f"   Batch {batch_num}: Loaded {len(batch_data)} videos (Total: {len(all_data)}/{total_entities})")
+        
+        if len(batch_data) == 0:
+            break
+        
+        batch_num += 1
+    
+    print(f"✅ Loaded {len(all_data)} videos total")
     
     if tracker:
         tracker.end_phase()
