@@ -369,22 +369,32 @@ def search_duplicates_aggregated(
         tracker.end_phase()
         tracker.start_phase("Search duplicates")
     
-    print(f"🎯 Searching for duplicates (threshold: {similarity_threshold})...\n")
+    print(f"🎯 Searching for duplicates (threshold: {similarity_threshold})...")
+    print(f"📋 Using Two-Pass Algorithm for maximum accuracy\n")
     
-    # Track duplicates
-    seen_jobs: Set[str] = set()
-    unique_videos: List[Dict] = []
-    duplicates: List[Dict] = []
+    # ============================================================
+    # PASS 1: Find all duplicate pairs (without classification)
+    # ============================================================
+    print("🔍 PASS 1: Finding all duplicate pairs...")
     
-    # Use tqdm for progress bar if available
-    video_iterator = tqdm(all_data, desc="🔍 Searching", unit="video") if tracker else all_data
+    # Store all duplicate pairs: (job_id1, job_id2, similarity)
+    duplicate_pairs: List[tuple] = []
+    video_info: Dict[str, Dict] = {}  # job_id -> {url, embedding}
+    
+    # Build video info map
+    for video in all_data:
+        video_info[video["job_id"]] = {
+            "url": video["url"],
+            "embedding": video["embedding"]
+        }
+    
+    # Use tqdm for progress bar
+    video_iterator = tqdm(all_data, desc="   Pass 1", unit="video") if tracker else all_data
     
     processed = 0
-    for idx, video in enumerate(video_iterator):
+    for video in video_iterator:
         job_id = video["job_id"]
-        
-        if job_id in seen_jobs:
-            continue  # Already marked as duplicate
+        embedding = video["embedding"]
         
         processed += 1
         
@@ -392,14 +402,8 @@ def search_duplicates_aggregated(
         if tracker and processed % 100 == 0:
             tracker.update_stats()
         
-        # Show progress without tqdm (fallback)
-        if not tracker and processed % 50 == 0:
-            print(f"📊 Progress: {processed}/{len(all_data)} videos processed...")
-        
-        # Search similar videos
-        embedding = video["embedding"]
-        
         try:
+            # Search similar videos
             search_results = collection.search(
                 data=[embedding],
                 anns_field="embedding",
@@ -408,10 +412,7 @@ def search_duplicates_aggregated(
                 output_fields=["job_id", "url"]
             )
             
-            # Find best match (excluding self)
-            max_similarity = 0.0
-            best_match = None
-            
+            # Collect all pairs above threshold
             for hit in search_results[0]:
                 hit_job_id = hit.entity.get("job_id")
                 
@@ -419,40 +420,97 @@ def search_duplicates_aggregated(
                 if hit_job_id == job_id:
                     continue
                 
-                # Skip already processed
-                if hit_job_id in seen_jobs:
-                    continue
-                
-                # Check similarity
-                if hit.score > max_similarity:
-                    max_similarity = hit.score
-                    best_match = {
-                        "job_id": hit_job_id,
-                        "url": hit.entity.get("url"),
-                        "score": hit.score
-                    }
-            
-            # Check if duplicate
-            if max_similarity >= similarity_threshold and best_match:
-                # Mark as duplicate
-                seen_jobs.add(job_id)
-                duplicates.append({
-                    "duplicate_url": video["url"],
-                    "duplicate_job_id": job_id,
-                    "original_job_id": best_match["job_id"],
-                    "original_url": best_match["url"],
-                    "similarity": f"{max_similarity:.6f}"
-                })
-            else:
-                # Unique video
-                unique_videos.append({
-                    "url": video["url"],
-                    "job_id": job_id
-                })
+                # Only add if similarity >= threshold
+                if hit.score >= similarity_threshold:
+                    # Add pair (normalize: always smaller job_id first to avoid duplicates)
+                    pair = tuple(sorted([job_id, hit_job_id])) + (hit.score,)
+                    duplicate_pairs.append(pair)
         
         except Exception as e:
             print(f"⚠️  Error searching {job_id}: {e}")
             continue
+    
+    # Remove duplicate pairs (same pair with different order)
+    duplicate_pairs = list(set(duplicate_pairs))
+    print(f"   ✅ Found {len(duplicate_pairs)} duplicate pairs")
+    
+    # ============================================================
+    # PASS 2: Group into clusters and select originals
+    # ============================================================
+    print(f"\n🔗 PASS 2: Grouping into clusters and selecting originals...")
+    
+    # Build graph: job_id -> set of connected job_ids
+    graph: Dict[str, Set[str]] = {}
+    all_job_ids = set(video_info.keys())
+    
+    # Initialize graph
+    for job_id in all_job_ids:
+        graph[job_id] = set()
+    
+    # Add edges from duplicate pairs
+    for job_id1, job_id2, similarity in duplicate_pairs:
+        graph[job_id1].add(job_id2)
+        graph[job_id2].add(job_id1)
+    
+    # Find connected components (clusters) using DFS
+    visited: Set[str] = set()
+    clusters: List[Set[str]] = []
+    
+    def dfs(node: str, cluster: Set[str]):
+        """Depth-first search to find connected component"""
+        if node in visited:
+            return
+        visited.add(node)
+        cluster.add(node)
+        for neighbor in graph[node]:
+            dfs(neighbor, cluster)
+    
+    # Find all clusters
+    for job_id in all_job_ids:
+        if job_id not in visited:
+            cluster = set()
+            dfs(job_id, cluster)
+            if cluster:
+                clusters.append(cluster)
+    
+    print(f"   ✅ Found {len(clusters)} clusters")
+    
+    # Select original for each cluster (first video in cluster)
+    originals: Set[str] = set()
+    duplicates: List[Dict] = []
+    unique_videos: List[Dict] = []
+    
+    for cluster in clusters:
+        # Sort cluster to ensure deterministic selection
+        sorted_cluster = sorted(cluster)
+        original_job_id = sorted_cluster[0]  # First video = original
+        originals.add(original_job_id)
+        
+        # Add original to unique videos
+        unique_videos.append({
+            "url": video_info[original_job_id]["url"],
+            "job_id": original_job_id
+        })
+        
+        # Add all others as duplicates
+        for duplicate_job_id in sorted_cluster[1:]:
+            # Find similarity between duplicate and original
+            # (use the pair with highest similarity if multiple paths exist)
+            max_sim = 0.0
+            for job_id1, job_id2, sim in duplicate_pairs:
+                if (job_id1 == duplicate_job_id and job_id2 == original_job_id) or \
+                   (job_id1 == original_job_id and job_id2 == duplicate_job_id):
+                    max_sim = max(max_sim, sim)
+            
+            duplicates.append({
+                "duplicate_url": video_info[duplicate_job_id]["url"],
+                "duplicate_job_id": duplicate_job_id,
+                "original_job_id": original_job_id,
+                "original_url": video_info[original_job_id]["url"],
+                "similarity": f"{max_sim:.6f}" if max_sim > 0 else "0.000000"
+            })
+    
+    print(f"   ✅ Selected {len(originals)} originals, {len(duplicates)} duplicates")
     
     if tracker:
         tracker.end_phase()
