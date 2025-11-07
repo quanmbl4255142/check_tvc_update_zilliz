@@ -502,25 +502,37 @@ def search_duplicates_aggregated(
     
     # Remove duplicate pairs (same pair with different order)
     duplicate_pairs = list(set(duplicate_pairs))
-    print(f"   ✅ Found {len(duplicate_pairs)} duplicate pairs")
+    print(f"   ✅ Found {len(duplicate_pairs)} duplicate pairs (including cross-chunk)")
     
     # ============================================================
     # PASS 2: Group into clusters and select originals
     # ============================================================
     print(f"\n🔗 PASS 2: Grouping into clusters and selecting originals...")
     
+    # Filter duplicate pairs: Only keep pairs where BOTH videos are in current chunk
+    all_job_ids = set(video_info.keys())
+    chunk_duplicate_pairs = [
+        (job_id1, job_id2, similarity) 
+        for job_id1, job_id2, similarity in duplicate_pairs
+        if job_id1 in all_job_ids and job_id2 in all_job_ids
+    ]
+    
+    cross_chunk_pairs = len(duplicate_pairs) - len(chunk_duplicate_pairs)
+    if cross_chunk_pairs > 0:
+        print(f"   📊 Filtered: {len(chunk_duplicate_pairs)} pairs within chunk, {cross_chunk_pairs} cross-chunk pairs (will be handled in merge step)")
+    
     # Build graph: job_id -> set of connected job_ids
     graph: Dict[str, Set[str]] = {}
-    all_job_ids = set(video_info.keys())
     
     # Initialize graph
     for job_id in all_job_ids:
         graph[job_id] = set()
     
-    # Add edges from duplicate pairs
-    for job_id1, job_id2, similarity in duplicate_pairs:
-        graph[job_id1].add(job_id2)
-        graph[job_id2].add(job_id1)
+    # Add edges from duplicate pairs (only within chunk)
+    for job_id1, job_id2, similarity in chunk_duplicate_pairs:
+        if job_id1 in graph and job_id2 in graph:
+            graph[job_id1].add(job_id2)
+            graph[job_id2].add(job_id1)
     
     # Find connected components (clusters) using DFS
     visited: Set[str] = set()
@@ -567,18 +579,56 @@ def search_duplicates_aggregated(
             # Find similarity between duplicate and original
             # (use the pair with highest similarity if multiple paths exist)
             max_sim = 0.0
-            for job_id1, job_id2, sim in duplicate_pairs:
+            for job_id1, job_id2, sim in chunk_duplicate_pairs:
                 if (job_id1 == duplicate_job_id and job_id2 == original_job_id) or \
                    (job_id1 == original_job_id and job_id2 == duplicate_job_id):
                     max_sim = max(max_sim, sim)
             
-                duplicates.append({
+            duplicates.append({
                 "duplicate_url": video_info[duplicate_job_id]["url"],
                 "duplicate_job_id": duplicate_job_id,
                 "original_job_id": original_job_id,
                 "original_url": video_info[original_job_id]["url"],
                 "similarity": f"{max_sim:.6f}" if max_sim > 0 else "0.000000"
             })
+    
+    # Handle cross-chunk duplicates: If video in chunk duplicates with video outside chunk,
+    # mark the video in chunk as duplicate (will be handled when processing the other chunk)
+    cross_chunk_duplicates = []
+    for job_id1, job_id2, similarity in duplicate_pairs:
+        if job_id1 in all_job_ids and job_id2 not in all_job_ids:
+            # job_id1 in chunk, job_id2 outside chunk
+            cross_chunk_duplicates.append({
+                "duplicate_url": video_info[job_id1]["url"],
+                "duplicate_job_id": job_id1,
+                "original_job_id": job_id2,
+                "original_url": f"(outside chunk, index > {chunk_end if chunk_end else 'unknown'})",
+                "similarity": f"{similarity:.6f}",
+                "note": "cross-chunk"
+            })
+            # Remove from unique videos if it was added
+            unique_videos = [v for v in unique_videos if v["job_id"] != job_id1]
+            if job_id1 in originals:
+                originals.remove(job_id1)
+        elif job_id2 in all_job_ids and job_id1 not in all_job_ids:
+            # job_id2 in chunk, job_id1 outside chunk
+            cross_chunk_duplicates.append({
+                "duplicate_url": video_info[job_id2]["url"],
+                "duplicate_job_id": job_id2,
+                "original_job_id": job_id1,
+                "original_url": f"(outside chunk, index < {chunk_start if chunk_start else 'unknown'})",
+                "similarity": f"{similarity:.6f}",
+                "note": "cross-chunk"
+            })
+            # Remove from unique videos if it was added
+            unique_videos = [v for v in unique_videos if v["job_id"] != job_id2]
+            if job_id2 in originals:
+                originals.remove(job_id2)
+    
+    if cross_chunk_duplicates:
+        print(f"   ⚠️  Found {len(cross_chunk_duplicates)} cross-chunk duplicates (will be resolved in merge step)")
+        # Add to duplicates list
+        duplicates.extend(cross_chunk_duplicates)
     
     print(f"   ✅ Selected {len(originals)} originals, {len(duplicates)} duplicates")
     
