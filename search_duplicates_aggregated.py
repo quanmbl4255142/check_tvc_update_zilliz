@@ -222,6 +222,8 @@ def search_duplicates_aggregated(
     enable_tracking: bool = True,
     batch_size: int = 10,
     num_threads: int = 4,
+    chunk_start: int = None,
+    chunk_end: int = None,
 ) -> tuple[int, int]:
     """
     Search duplicates với aggregated vectors - ĐƠN GIẢN HƠN NHIỀU!
@@ -372,6 +374,18 @@ def search_duplicates_aggregated(
         batch_num += 1
     
     print(f"✅ Loaded {len(all_data)} videos total")
+    
+    # Apply chunk filtering if specified
+    original_count = len(all_data)
+    if chunk_start is not None or chunk_end is not None:
+        start_idx = chunk_start if chunk_start is not None else 0
+        end_idx = chunk_end if chunk_end is not None else len(all_data)
+        start_idx = max(0, start_idx)
+        end_idx = min(len(all_data), end_idx)
+        
+        all_data = all_data[start_idx:end_idx]
+        print(f"📦 CHUNK MODE: Processing videos {start_idx} to {end_idx-1} ({len(all_data)} videos)")
+        print(f"   (Skipped {start_idx} videos at start, {original_count - end_idx} videos at end)")
     
     if tracker:
         tracker.end_phase()
@@ -717,6 +731,18 @@ def main():
         help="Number of parallel threads (default: 4). Higher = faster but more CPU"
     )
     parser.add_argument(
+        "--chunk_start",
+        type=int,
+        default=None,
+        help="Start index for chunk processing (only process videos from this index). Use with --chunk_end"
+    )
+    parser.add_argument(
+        "--chunk_end",
+        type=int,
+        default=None,
+        help="End index for chunk processing (only process videos up to this index). Use with --chunk_start"
+    )
+    parser.add_argument(
         "--config-only",
         action="store_true",
         help="Only print configuration"
@@ -736,6 +762,37 @@ def main():
         print(f"❌ ERROR: Number of threads must be >= 1 (got {args.num_threads})", file=sys.stderr)
         sys.exit(1)
     
+    # Validate chunk parameters
+    if (args.chunk_start is not None and args.chunk_end is not None):
+        if args.chunk_start < 0:
+            print(f"❌ ERROR: chunk_start must be >= 0 (got {args.chunk_start})", file=sys.stderr)
+            sys.exit(1)
+        if args.chunk_end <= args.chunk_start:
+            print(f"❌ ERROR: chunk_end must be > chunk_start (got {args.chunk_start}-{args.chunk_end})", file=sys.stderr)
+            sys.exit(1)
+    elif args.chunk_start is not None or args.chunk_end is not None:
+        print(f"⚠️  WARNING: Both --chunk_start and --chunk_end must be specified. Ignoring chunk mode.", file=sys.stderr)
+        args.chunk_start = None
+        args.chunk_end = None
+    
+    # Update output filenames if chunk mode
+    unique_csv = args.unique_csv
+    report_csv = args.report_csv
+    invalid_csv = args.invalid_csv
+    
+    if args.chunk_start is not None and args.chunk_end is not None:
+        # Add chunk suffix to avoid overwriting
+        base_unique = os.path.splitext(args.unique_csv)[0]
+        base_report = os.path.splitext(args.report_csv)[0]
+        base_invalid = os.path.splitext(args.invalid_csv)[0]
+        ext_unique = os.path.splitext(args.unique_csv)[1] or ".csv"
+        ext_report = os.path.splitext(args.report_csv)[1] or ".csv"
+        ext_invalid = os.path.splitext(args.invalid_csv)[1] or ".csv"
+        
+        unique_csv = f"{base_unique}_chunk_{args.chunk_start}_{args.chunk_end}{ext_unique}"
+        report_csv = f"{base_report}_chunk_{args.chunk_start}_{args.chunk_end}{ext_report}"
+        invalid_csv = f"{base_invalid}_chunk_{args.chunk_start}_{args.chunk_end}{ext_invalid}"
+    
     # Print config
     print_config()
     print(f"\n🎯 AGGREGATED MODE:")
@@ -747,6 +804,11 @@ def main():
     print(f"   → Parallel threads: {args.num_threads}")
     print(f"   → Expected speedup: {args.batch_size * args.num_threads}×")
     
+    if args.chunk_start is not None and args.chunk_end is not None:
+        print(f"\n📦 CHUNK MODE:")
+        print(f"   → Processing videos {args.chunk_start} to {args.chunk_end-1}")
+        print(f"   → Output files will have suffix: _chunk_{args.chunk_start}_{args.chunk_end}")
+    
     if args.config_only:
         return
     
@@ -754,26 +816,28 @@ def main():
         unique_count, dup_count = search_duplicates_aggregated(
             args.collection,
             args.cosine_thresh,
-            args.unique_csv,
-            args.report_csv,
+            unique_csv,
+            report_csv,
             args.top_k,
             args.auto_clean,
-            args.invalid_csv,
+            invalid_csv,
             enable_tracking=True,  # Always enable tracking
             batch_size=args.batch_size,
-            num_threads=args.num_threads
+            num_threads=args.num_threads,
+            chunk_start=args.chunk_start,
+            chunk_end=args.chunk_end
         )
         
         print(f"\n🎉 Search complete!")
         print(f"   ✅ Unique videos: {unique_count}")
         print(f"   ❌ Duplicates found: {dup_count}")
-        print(f"   → Unique URLs: {args.unique_csv}")
-        print(f"   → Duplicates report: {args.report_csv}")
+        print(f"   → Unique URLs: {unique_csv}")
+        print(f"   → Duplicates report: {report_csv}")
         
         if args.auto_clean:
             print(f"\n🧼 Auto-clean was enabled:")
             print(f"   → Invalid URLs removed (PNG, images, broken URLs)")
-            print(f"   → Check {args.invalid_csv} for details")
+            print(f"   → Check {invalid_csv} for details")
         
     except Exception as e:
         print(f"\n❌ ERROR: {e}", file=sys.stderr)
