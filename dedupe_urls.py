@@ -4,7 +4,7 @@ import os
 import sys
 from urllib.parse import urlparse
 
-
+# normalize_url là phương thức dùng để chuẩn hóa url. Nói dễ hiểu là nó sẽ loại bỏ các ký tự không cần thiết và chuẩn hóa url.
 def normalize_url(u: str) -> str:
     s = (u or "").strip().strip('"').strip("'")
     # Basic normalization: collapse scheme/host case, drop trailing slash (path only), keep query intact
@@ -14,8 +14,9 @@ def normalize_url(u: str) -> str:
         netloc = (p.netloc or "").lower()
         path = p.path or ""
         if len(path) > 1 and path.endswith("/"):
+            # [:-1] là phương thức lấy tất cả các ký tự trừ ký tự cuối cùng.
             path = path[:-1]
-        # Keep params, query, fragment as-is to avoid over-merging distinct assets
+        # f"{scheme}://{netloc}{path}" là phương thức tạo url mới.
         rebuilt = f"{scheme}://{netloc}{path}"
         if p.params:
             rebuilt += f";{p.params}"
@@ -27,7 +28,8 @@ def normalize_url(u: str) -> str:
     except Exception:
         return s
 
-
+# dedupe_file là phương thức dùng để loại bỏ các url trùng lặp. Nói dễ hiểu là nó sẽ loại bỏ các url trùng lặp và lưu vào file output_path.
+# cách vận hành để tìm ra url trùng dùng giải thuật là hash table. Nghĩa là nó sẽ lưu tất cả các url vào một hash table, sau đó dùng hash function để tìm ra url trùng lặp.
 def dedupe_file(input_path: str, output_path: str, report_path: str) -> tuple[int, int]:
     total = 0
     kept = 0

@@ -258,15 +258,17 @@ def search_duplicates_aggregated(
     
     if not utility.has_collection(collection_name):
         print(f"❌ ERROR: Collection '{collection_name}' not found!", file=sys.stderr)
-        print(f"Please run upload_aggregated_to_milvus.py first.", file=sys.stderr)
+        print(f"Please run direct_upload_to_zilliz.py or upload_aggregated_to_milvus.py first.", file=sys.stderr)
+        print(f"\n💡 TIP: Make sure you're using the correct collection name.", file=sys.stderr)
+        print(f"   If you uploaded with direct_upload_to_zilliz.py, use that collection name.", file=sys.stderr)
         sys.exit(1)
     
     collection = Collection(collection_name)
     collection.load()
     
     total_entities = collection.num_entities
-    print(f"📊 Collection has {total_entities} vectors")
-    print(f"🎯 Each video = 1 vector (aggregated from 3 frames)")
+    print(f"📊 Collection '{collection_name}' has {total_entities} vectors")
+    print(f"🎯 Each video = 1 vector (from first frame or aggregated)")
     
     # Get all videos - Query in batches using ID range (avoid offset+limit limit)
     # Note: gRPC message size limit is ~4MB
@@ -284,39 +286,345 @@ def search_duplicates_aggregated(
         end_idx = min(total_entities, end_idx)
         
         print(f"📦 CHUNK MODE: Will only load videos {start_idx} to {end_idx-1} ({end_idx - start_idx} videos)")
-        print(f"   Step 1: Fetching IDs in range...")
+        print(f"   💡 Using job_id range query (more accurate than position-based query)")
         
-        # Fetch IDs in chunk range using offset/limit
-        all_ids = []
-        id_offset = start_idx
-        id_batch_size = 10000  # Safe: offset + limit = 10000 < 16384
-        target_count = end_idx - start_idx
+        # CRITICAL FIX: Query by job_id range instead of position (offset/limit)
+        # When uploading with direct_upload_to_zilliz.py --start 24500, job_ids use format :04d
+        # Format: url_0000 to url_9999 (4 digits), url_10000 to url_99999 (5 digits, no leading zero)
+        # 
+        # IMPORTANT: String comparison issue when range spans < 10000 and >= 10000
+        # Example: "url_9999" < "url_10000" → False (wrong! because "9" > "1" in string comparison)
+        # Solution: If range includes < 10000, we need to handle it specially
+        # But if range is all >= 10000, string comparison works correctly
         
-        while id_offset < end_idx and len(all_ids) < target_count:
-            remaining = end_idx - id_offset
-            current_limit = min(id_batch_size, remaining)
-            
-            # Ensure offset + limit <= 16384
-            if id_offset + current_limit > 16384:
-                current_limit = 16384 - id_offset
-                if current_limit <= 0:
-                    break
-            
-            id_batch = collection.query(
-                expr="id >= 0",
-                output_fields=["id"],
-                limit=current_limit,
-                offset=id_offset
+        # Use format matching direct_upload_to_zilliz.py (:04d)
+        start_job_id_4d = f"url_{start_idx:04d}"  # Format: url_24500 (matches upload script)
+        end_job_id_4d = f"url_{end_idx:04d}"       # Format: url_25000
+        
+        print(f"   📋 Querying job_id range: '{start_job_id_4d}' to '{end_job_id_4d}' (exclusive)")
+        print(f"   💡 Note: Using format :04d to match direct_upload_to_zilliz.py")
+        
+        # Check if range spans the 10000 boundary (could cause string comparison issues)
+        if start_idx < 10000 and end_idx > 10000:
+            print(f"   ⚠️  WARNING: Range spans 10000 boundary - string comparison may have issues")
+            print(f"   💡 Will query and filter results to ensure accuracy")
+        
+        # Query by job_id range
+        all_data = []
+        try:
+            # Query all videos in job_id range
+            # For ranges >= 10000, string comparison works correctly
+            # For ranges < 10000, also works correctly
+            # Only issue is when range spans both (< 10000 and >= 10000)
+            query_result = collection.query(
+                expr=f'job_id >= "{start_job_id_4d}" and job_id < "{end_job_id_4d}"',
+                output_fields=["job_id", "url", "embedding"]
             )
-            if not id_batch:
-                break
-            all_ids.extend([item["id"] for item in id_batch])
-            id_offset += len(id_batch)
             
-            if len(id_batch) < current_limit:
-                break
+            if query_result:
+                # CRITICAL: Always filter by numeric comparison to ensure accuracy
+                # String comparison can fail when job_ids have different digit counts
+                def extract_job_num(job_id_str):
+                    try:
+                        return int(job_id_str.split('_')[1])
+                    except:
+                        return -1
+                
+                # Filter to ensure all job_ids are in numeric range
+                filtered_data = [
+                    item for item in query_result
+                    if start_idx <= extract_job_num(item["job_id"]) < end_idx
+                ]
+                
+                if len(filtered_data) != len(query_result):
+                    print(f"   ⚠️  Filtered {len(query_result) - len(filtered_data)} videos outside numeric range [{start_idx}, {end_idx})")
+                
+                all_data = filtered_data
+                print(f"   ✅ Found {len(all_data)} videos with job_id in range [{start_job_id_4d}, {end_job_id_4d})")
+                
+                # Verify job_ids are in expected range
+                if all_data:
+                    job_ids_found = [item["job_id"] for item in all_data]
+                    job_ids_sorted = sorted(job_ids_found)
+                    print(f"   📊 Job ID range found: {job_ids_sorted[0]} to {job_ids_sorted[-1]}")
+                    
+                    job_nums = [extract_job_num(jid) for jid in job_ids_found]
+                    if job_nums and all(n >= 0 for n in job_nums):
+                        min_job_num = min(job_nums)
+                        max_job_num = max(job_nums)
+                        print(f"   📊 Numeric range: {min_job_num} to {max_job_num} (expected: {start_idx} to {end_idx-1})")
+                        
+                        # Check if range matches (should always match after filtering)
+                        if min_job_num < start_idx or max_job_num >= end_idx:
+                            print(f"   ⚠️  WARNING: Job ID range doesn't match expected range!")
+                            print(f"      Expected: [{start_idx}, {end_idx})")
+                            print(f"      Found: [{min_job_num}, {max_job_num+1})")
+                    
+                    # Check count
+                    expected_count = end_idx - start_idx
+                    if len(all_data) != expected_count:
+                        print(f"   ⚠️  WARNING: Expected {expected_count} videos but got {len(all_data)}")
+                        print(f"   💡 This might be normal if some videos failed to upload")
+                else:
+                    print(f"   ❌ ERROR: No videos found after filtering to numeric range [{start_idx}, {end_idx})")
+                    sys.exit(1)
+            else:
+                print(f"   ❌ ERROR: No videos found with job_id in range [{start_job_id_4d}, {end_job_id_4d})")
+                print(f"   💡 TIP: Check if you uploaded with the correct --start parameter")
+                print(f"   💡 TIP: Verify job_id format in Zilliz matches 'url_XXXX' (4 digits for < 10000, no leading zero for >= 10000)")
+                sys.exit(1)
+        except Exception as e:
+            print(f"   ❌ ERROR querying by job_id range: {e}")
+            print(f"   💡 Falling back to position-based query (may be inaccurate)...")
+            # Fallback to old method (but warn user)
+            all_data = []  # Will be populated by old method
+            all_ids = []
+            target_count = end_idx - start_idx
+            
+            # Continue with old position-based query method below
+            use_job_id_query = False
+        else:
+            # Successfully queried by job_id, skip position-based query
+            use_job_id_query = True
+            print(f"   ✅ Successfully loaded {len(all_data)} videos using job_id range query")
         
-        print(f"   ✅ Found {len(all_ids)} IDs in chunk range")
+        # Only use position-based query if job_id query failed
+        if not use_job_id_query:
+            target_count = end_idx - start_idx  # Define target_count for fallback method
+            all_ids = []  # Initialize all_ids for fallback method
+            
+            # If start_idx < 16384, we can use offset/limit directly
+            # But if end_idx > 16384, we need to switch to ID range query after hitting the limit
+            if start_idx < 16384:
+                id_offset = start_idx
+                id_batch_size = 10000  # Safe: offset + limit = 10000 < 16384
+                
+                while id_offset < end_idx and len(all_ids) < target_count:
+                    remaining = end_idx - id_offset
+                    current_limit = min(id_batch_size, remaining)
+                    
+                    # Ensure offset + limit <= 16384
+                    if id_offset + current_limit > 16384:
+                        current_limit = 16384 - id_offset
+                        if current_limit <= 0:
+                            # We've hit the 16384 limit, switch to ID range query
+                            break
+                    
+                    id_batch = collection.query(
+                        expr="id >= 0",
+                        output_fields=["id"],
+                        limit=current_limit,
+                        offset=id_offset
+                    )
+                    if not id_batch:
+                        break
+                    all_ids.extend([item["id"] for item in id_batch])
+                    id_offset += len(id_batch)
+                    
+                    if len(id_batch) < current_limit:
+                        break
+                
+                # If we haven't fetched all IDs yet and hit the 16384 limit, switch to ID range query
+                if id_offset < end_idx and len(all_ids) < target_count:
+                    print(f"   ⚠️  Hit 16384 offset limit at index {id_offset}")
+                    print(f"   ❌ ERROR: Cannot fetch beyond 16384 with offset/limit!")
+                    print(f"   💡 SOLUTION: Split chunk into smaller ranges:")
+                    print(f"      - Range 1: {start_idx}-16384")
+                    print(f"      - Range 2: 16384-{end_idx}")
+                    print(f"   ⚠️  Fetching all IDs from 0 to {end_idx-1} to ensure accuracy...")
+                
+                # CRITICAL FIX: Must fetch ALL from 0 to end_idx, then slice
+                # ID range query doesn't maintain insertion order!
+                temp_all_ids = []
+                fetch_offset = 0
+                
+                # CRITICAL: Can only fetch up to index 16384 with offset/limit
+                # If end_idx > 16384, we cannot fetch accurately!
+                # Solution: Adjust end_idx to 16384 and warn user
+                if end_idx > 16384:
+                    print(f"   ❌ ERROR: end_idx ({end_idx}) > 16384 - cannot fetch beyond 16384 with offset/limit!")
+                    print(f"   💡 SOLUTION: Split into smaller chunks:")
+                    print(f"      - Chunk 1: {start_idx}-16384")
+                    print(f"      - Chunk 2: 16384-{end_idx}")
+                    print(f"   ⚠️  Will only process range [{start_idx}, 16384) for now")
+                    end_idx = 16384
+                    target_count = end_idx - start_idx
+                
+                max_fetchable = min(end_idx, 16384)
+                
+                while fetch_offset < max_fetchable:
+                    # Safe limit: offset + limit <= 16384
+                    remaining = max_fetchable - fetch_offset
+                    current_limit = min(16384 - fetch_offset, remaining)
+                    
+                    if current_limit <= 0:
+                        break
+                    
+                    id_batch = collection.query(
+                        expr="id >= 0",
+                        output_fields=["id"],
+                        limit=current_limit,
+                        offset=fetch_offset
+                    )
+                    if not id_batch:
+                        break
+                    
+                    batch_ids = [item["id"] for item in id_batch]
+                    temp_all_ids.extend(batch_ids)
+                    fetch_offset += len(batch_ids)
+                    
+                    if len(id_batch) < current_limit:
+                        break
+                
+                # Slice to get target range [start_idx, end_idx)
+                # But we can only fetch up to max_fetchable (16384)
+                actual_end = min(end_idx, len(temp_all_ids))
+                
+                if len(temp_all_ids) > start_idx:
+                    all_ids = temp_all_ids[start_idx:actual_end]
+                    if actual_end < end_idx:
+                        print(f"   ⚠️  WARNING: Could only fetch up to index {len(temp_all_ids)-1} (requested {end_idx-1})")
+                        print(f"   ⚠️  Extracted {len(all_ids):,} IDs in range [{start_idx}, {actual_end}) instead of [{start_idx}, {end_idx})")
+                    else:
+                        print(f"   ✅ Fetched {len(temp_all_ids):,} IDs, extracted {len(all_ids):,} in range [{start_idx}, {end_idx})")
+                else:
+                    all_ids = []
+                    print(f"   ❌ ERROR: Could not fetch enough IDs (got {len(temp_all_ids)}, need at least {start_idx})")
+                
+                    if 'temp_all_ids' in locals():
+                        del temp_all_ids
+            else:
+                # start_idx >= 16384: Cannot use offset/limit, must use ID range query
+                # SOLUTION: Fetch ALL IDs from 0 to end_idx, then slice to get [start_idx, end_idx)
+                # This ensures accuracy regardless of ID ordering
+                print(f"   ⚠️  start_idx ({start_idx}) >= 16384, using ID range query...")
+                print(f"   📊 Fetching all IDs from 0 to {end_idx-1}, will extract range [{start_idx}, {end_idx})")
+                print(f"   ⚠️  NOTE: Must fetch from beginning to maintain index order accuracy")
+                
+                # Strategy: Fetch all IDs sequentially from beginning to end_idx
+                # Then slice to get only [start_idx, end_idx) range
+                # This is the ONLY reliable way when IDs may not be sequential
+                temp_all_ids = []  # Store all IDs from 0 to end_idx
+                max_id_so_far = -1
+                id_query_batch_size = 16384  # Max limit per query (renamed to avoid conflict with function parameter)
+                ids_fetched = 0  # Count of IDs fetched (by position)
+                
+                # Fetch IDs until we have enough to cover end_idx
+                while ids_fetched < end_idx:
+                    # Query next batch of IDs (ordered by ID value, not insertion order)
+                    remaining_batch = collection.query(
+                        expr=f"id > {max_id_so_far}",
+                        output_fields=["id"],
+                        limit=id_query_batch_size
+                    )
+                    if not remaining_batch:
+                        break
+                    
+                    batch_ids = [item["id"] for item in remaining_batch]
+                    batch_size_actual = len(batch_ids)
+                    
+                    # Add all IDs to temp list (we'll slice later)
+                    temp_all_ids.extend(batch_ids)
+                    ids_fetched += batch_size_actual
+                    max_id_so_far = max(batch_ids)
+                    
+                    # Early stop: if we've fetched enough to cover end_idx
+                    if ids_fetched >= end_idx:
+                        break
+                    
+                    # If batch is smaller than limit, we've reached the end
+                    if batch_size_actual < id_query_batch_size:
+                        break
+                    
+                    # Progress update for large fetches
+                    if ids_fetched % 50000 == 0:
+                        print(f"      Fetched {ids_fetched:,} IDs so far...")
+                
+                # Now slice to get only the IDs in our target range [start_idx, end_idx)
+                if len(temp_all_ids) >= end_idx:
+                    all_ids = temp_all_ids[start_idx:end_idx]
+                    print(f"   ✅ Fetched {len(temp_all_ids):,} total IDs, extracted {len(all_ids):,} in range [{start_idx}, {end_idx})")
+                elif len(temp_all_ids) > start_idx:
+                    # We have some IDs but not enough
+                    all_ids = temp_all_ids[start_idx:]
+                    print(f"   ⚠️  WARNING: Only fetched {len(temp_all_ids):,} IDs (expected {end_idx}), extracted {len(all_ids):,} from index {start_idx}")
+                else:
+                    # We don't have enough IDs even to reach start_idx
+                    all_ids = []
+                    print(f"   ❌ ERROR: Only fetched {len(temp_all_ids):,} IDs, but need at least {start_idx}")
+                
+                # Clear temp list to free memory
+                del temp_all_ids
+            
+            print(f"   ✅ Found {len(all_ids)} IDs in chunk range (expected: {target_count})")
+            if len(all_ids) != target_count:
+                print(f"   ⚠️  WARNING: Expected {target_count} IDs but got {len(all_ids)}")
+            
+            # Now fetch embeddings for position-based query
+            print(f"   Step 2: Fetching embeddings in batches...")
+            print(f"   📊 Will fetch embeddings for {len(all_ids)} videos in batches of {MAX_QUERY_LIMIT}...")
+            
+            # Query embeddings by ID ranges
+            all_data = []
+            batch_num = 1
+            total_batches = (len(all_ids) + MAX_QUERY_LIMIT - 1) // MAX_QUERY_LIMIT
+            
+            for i in range(0, len(all_ids), MAX_QUERY_LIMIT):
+                batch_ids = all_ids[i:i + MAX_QUERY_LIMIT]
+                
+                if tracker:
+                    tracker.update_stats()
+                
+                print(f"   📦 Batch {batch_num}/{total_batches}: Querying {len(batch_ids)} IDs...", end=" ", flush=True)
+                
+                try:
+                    # Query by ID list (more efficient than offset)
+                    # Use smaller chunks to avoid message size limit
+                    chunk_size = 500  # Safe size to avoid gRPC message limit
+                    batch_data = []
+                    
+                    for j in range(0, len(batch_ids), chunk_size):
+                        chunk_ids = batch_ids[j:j + chunk_size]
+                        id_list_str = ",".join([str(id_val) for id_val in chunk_ids])
+                        
+                        try:
+                            chunk_data = collection.query(
+                                expr=f"id in [{id_list_str}]",
+                                output_fields=["job_id", "url", "embedding"]
+                            )
+                            batch_data.extend(chunk_data)
+                        except Exception as e:
+                            # If still too large, split even smaller
+                            if "message larger than max" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                                print(f"\n   ⚠️  Chunk still too large, splitting to 100 IDs...")
+                                micro_chunk_size = 100
+                                for k in range(0, len(chunk_ids), micro_chunk_size):
+                                    micro_chunk_ids = chunk_ids[k:k + micro_chunk_size]
+                                    micro_id_str = ",".join([str(id_val) for id_val in micro_chunk_ids])
+                                    micro_data = collection.query(
+                                        expr=f"id in [{micro_id_str}]",
+                                        output_fields=["job_id", "url", "embedding"]
+                                    )
+                                    batch_data.extend(micro_data)
+                            else:
+                                print(f"\n   ⚠️  Error querying chunk: {e}")
+                                raise
+                    
+                except Exception as e:
+                    print(f"\n   ❌ ERROR fetching batch {batch_num}: {e}")
+                    print(f"   ⚠️  Skipping this batch and continuing...")
+                    continue
+                
+                all_data.extend(batch_data)
+                print(f"✅ Loaded {len(batch_data)} videos (Total: {len(all_data)}/{len(all_ids)})")
+                
+                if len(batch_data) == 0:
+                    print(f"   ⚠️  No data returned for batch {batch_num}, stopping...")
+                    break
+                
+                batch_num += 1
+            
+            print(f"✅ Loaded {len(all_data)} videos total (position-based query)")
     else:
         # Load all IDs (full mode)
         print("   Step 1: Fetching all IDs...")
@@ -324,37 +632,32 @@ def search_duplicates_aggregated(
         id_offset = 0
         id_batch_size = 10000  # Safe: offset + limit = 10000 < 16384
         
+        # Use offset/limit until we hit the 16384 limit, then switch to ID range query
         while id_offset < total_entities:
             remaining = total_entities - id_offset
             current_limit = min(id_batch_size, remaining)
             
-            # Ensure offset + limit <= 16384
+            # Check if we're about to hit the 16384 limit
             if id_offset + current_limit > 16384:
+                # Use the remaining offset/limit space
                 current_limit = 16384 - id_offset
                 if current_limit <= 0:
-                    # Switch to ID range query
-                    max_id_so_far = max(all_ids) if all_ids else -1
-                    remaining_batch = collection.query(
-                        expr=f"id > {max_id_so_far}",
-                        output_fields=["id"],
-                        limit=16384
-                    )
-                    if remaining_batch:
-                        all_ids.extend([item["id"] for item in remaining_batch])
-                        # Continue with ID range
-                        while len(remaining_batch) == 16384:
-                            new_max = max([item["id"] for item in remaining_batch])
-                            remaining_batch = collection.query(
-                                expr=f"id > {new_max}",
-                                output_fields=["id"],
-                                limit=16384
-                            )
-                            if remaining_batch:
-                                all_ids.extend([item["id"] for item in remaining_batch])
-                            else:
-                                break
+                    # We've exhausted offset/limit, switch to ID range query
                     break
+                
+                # Last batch using offset/limit
+                id_batch = collection.query(
+                    expr="id >= 0",
+                    output_fields=["id"],
+                    limit=current_limit,
+                    offset=id_offset
+                )
+                if id_batch:
+                    all_ids.extend([item["id"] for item in id_batch])
+                    id_offset += len(id_batch)
+                break
             
+            # Normal offset/limit query
             id_batch = collection.query(
                 expr="id >= 0",
                 output_fields=["id"],
@@ -369,55 +672,94 @@ def search_duplicates_aggregated(
             if len(id_batch) < current_limit:
                 break
         
-        print(f"   ✅ Found {len(all_ids)} IDs")
-    
-    print(f"   Step 2: Fetching embeddings in batches...")
-    
-    # Now query embeddings by ID ranges
-    all_data = []
-    batch_num = 1
-    
-    for i in range(0, len(all_ids), MAX_QUERY_LIMIT):
-        batch_ids = all_ids[i:i + MAX_QUERY_LIMIT]
+        # If we haven't fetched all IDs yet, continue with ID range query
+        if len(all_ids) < total_entities:
+            print(f"   ⚠️  Fetched {len(all_ids)}/{total_entities} using offset/limit, switching to ID range query...")
+            max_id_so_far = max(all_ids) if all_ids else -1
+            
+            # Continue fetching using ID range query
+            while len(all_ids) < total_entities:
+                remaining_batch = collection.query(
+                    expr=f"id > {max_id_so_far}",
+                    output_fields=["id"],
+                    limit=16384
+                )
+                if not remaining_batch:
+                    break
+                
+                batch_ids = [item["id"] for item in remaining_batch]
+                all_ids.extend(batch_ids)
+                max_id_so_far = max(batch_ids)
+                
+                if len(remaining_batch) < 16384:
+                    break
         
-        if tracker:
-            tracker.update_stats()
+        print(f"   ✅ Found {len(all_ids)} IDs (expected: {total_entities})")
         
-        try:
-            # Query by ID list (more efficient than offset)
-            id_list_str = ",".join([str(id_val) for id_val in batch_ids])
-            batch_data = collection.query(
-                expr=f"id in [{id_list_str}]",
-                output_fields=["job_id", "url", "embedding"]
-            )
-        except Exception as e:
-            # If ID list too large, query in smaller chunks
-            if "message larger than max" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or len(batch_ids) > 1000:
-                print(f"   ⚠️  Batch too large, splitting...")
-                # Split into smaller chunks
-                chunk_size = 500
+        print(f"   Step 2: Fetching embeddings in batches...")
+        print(f"   📊 Will fetch embeddings for {len(all_ids)} videos in batches of {MAX_QUERY_LIMIT}...")
+        
+        # Now query embeddings by ID ranges
+        all_data = []
+        batch_num = 1
+        total_batches = (len(all_ids) + MAX_QUERY_LIMIT - 1) // MAX_QUERY_LIMIT
+        
+        for i in range(0, len(all_ids), MAX_QUERY_LIMIT):
+            batch_ids = all_ids[i:i + MAX_QUERY_LIMIT]
+            
+            if tracker:
+                tracker.update_stats()
+            
+            print(f"   📦 Batch {batch_num}/{total_batches}: Querying {len(batch_ids)} IDs...", end=" ", flush=True)
+            
+            try:
+                # Query by ID list (more efficient than offset)
+                # Use smaller chunks to avoid message size limit
+                chunk_size = 500  # Safe size to avoid gRPC message limit
                 batch_data = []
+                
                 for j in range(0, len(batch_ids), chunk_size):
                     chunk_ids = batch_ids[j:j + chunk_size]
-                    chunk_id_str = ",".join([str(id_val) for id_val in chunk_ids])
-                    chunk_data = collection.query(
-                        expr=f"id in [{chunk_id_str}]",
-                        output_fields=["job_id", "url", "embedding"]
-                    )
-                    batch_data.extend(chunk_data)
-            else:
-                raise
+                    id_list_str = ",".join([str(id_val) for id_val in chunk_ids])
+                    
+                    try:
+                        chunk_data = collection.query(
+                            expr=f"id in [{id_list_str}]",
+                            output_fields=["job_id", "url", "embedding"]
+                        )
+                        batch_data.extend(chunk_data)
+                    except Exception as e:
+                        # If still too large, split even smaller
+                        if "message larger than max" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                            print(f"\n   ⚠️  Chunk still too large, splitting to 100 IDs...")
+                            micro_chunk_size = 100
+                            for k in range(0, len(chunk_ids), micro_chunk_size):
+                                micro_chunk_ids = chunk_ids[k:k + micro_chunk_size]
+                                micro_id_str = ",".join([str(id_val) for id_val in micro_chunk_ids])
+                                micro_data = collection.query(
+                                    expr=f"id in [{micro_id_str}]",
+                                    output_fields=["job_id", "url", "embedding"]
+                                )
+                                batch_data.extend(micro_data)
+                        else:
+                            print(f"\n   ⚠️  Error querying chunk: {e}")
+                            raise
+            
+            except Exception as e:
+                print(f"\n   ❌ ERROR fetching batch {batch_num}: {e}")
+                print(f"   ⚠️  Skipping this batch and continuing...")
+                continue
+            
+            all_data.extend(batch_data)
+            print(f"✅ Loaded {len(batch_data)} videos (Total: {len(all_data)}/{len(all_ids)})")
+            
+            if len(batch_data) == 0:
+                print(f"   ⚠️  No data returned for batch {batch_num}, stopping...")
+                break
+            
+            batch_num += 1
         
-        all_data.extend(batch_data)
-        
-        print(f"   Batch {batch_num}: Loaded {len(batch_data)} videos (Total: {len(all_data)}/{total_entities})")
-        
-        if len(batch_data) == 0:
-            break
-        
-        batch_num += 1
-    
-    print(f"✅ Loaded {len(all_data)} videos total")
+        print(f"✅ Loaded {len(all_data)} videos total")
     
     if tracker:
         tracker.end_phase()
@@ -511,13 +853,18 @@ def search_duplicates_aggregated(
         return batch_pairs
     
     # Divide videos into batches
+    # CRITICAL: Ensure batch_size is valid (max 10 per Zilliz limit)
+    search_batch_size = min(batch_size, 10)  # Zilliz limit: max 10 vectors per search
+    if search_batch_size != batch_size:
+        print(f"   ⚠️  WARNING: batch_size ({batch_size}) > 10, limiting to 10 (Zilliz limit)")
+    
     batches = []
-    for i in range(0, len(all_data), batch_size):
-        batch = all_data[i:i + batch_size]
+    for i in range(0, len(all_data), search_batch_size):
+        batch = all_data[i:i + search_batch_size]
         batches.append(batch)
     
     total_batches = len(batches)
-    print(f"   📦 Divided into {total_batches} batches (batch size: {batch_size})")
+    print(f"   📦 Divided into {total_batches} batches (batch size: {search_batch_size})")
     print(f"   🚀 Starting parallel search with {num_threads} threads...\n")
     
     # Parallel batch search
@@ -568,47 +915,121 @@ def search_duplicates_aggregated(
     
     # Separate within-chunk and cross-chunk pairs
     all_job_ids = set(video_info.keys())
-    chunk_duplicate_pairs = [
-        (job_id1, job_id2, similarity) 
-        for job_id1, job_id2, similarity in duplicate_pairs
-        if job_id1 in all_job_ids and job_id2 in all_job_ids
-    ]
     
-    cross_chunk_pairs_list = [
-        (job_id1, job_id2, similarity) 
-        for job_id1, job_id2, similarity in duplicate_pairs
-        if not (job_id1 in all_job_ids and job_id2 in all_job_ids)
-    ]
+    # DEBUG: Check first few pairs to understand the issue
+    if duplicate_pairs:
+        sample_pairs = duplicate_pairs[:5]
+        print(f"   🔍 DEBUG: Sample duplicate pairs (first 5):")
+        for job_id1, job_id2, sim in sample_pairs:
+            in_chunk1 = job_id1 in all_job_ids
+            in_chunk2 = job_id2 in all_job_ids
+            print(f"      Pair: {job_id1} (in_chunk={in_chunk1}) <-> {job_id2} (in_chunk={in_chunk2}), sim={sim:.4f}")
+        print(f"   🔍 DEBUG: Total job_ids in chunk: {len(all_job_ids)}")
+        print(f"   🔍 DEBUG: Sample job_ids: {list(all_job_ids)[:5]}")
+    
+    # CRITICAL FIX: Properly separate within-chunk and cross-chunk pairs
+    chunk_duplicate_pairs = []
+    cross_chunk_pairs_list = []
+    
+    for job_id1, job_id2, similarity in duplicate_pairs:
+        in_chunk1 = job_id1 in all_job_ids
+        in_chunk2 = job_id2 in all_job_ids
+        
+        if in_chunk1 and in_chunk2:
+            # Both in chunk: within-chunk pair
+            chunk_duplicate_pairs.append((job_id1, job_id2, similarity))
+        elif in_chunk1 or in_chunk2:
+            # One in chunk, one outside: cross-chunk pair
+            cross_chunk_pairs_list.append((job_id1, job_id2, similarity))
+        # If neither in chunk, skip (both outside current chunk)
     
     cross_chunk_pairs_count = len(cross_chunk_pairs_list)
-    if cross_chunk_pairs_count > 0:
+    if cross_chunk_pairs_count > 0 or len(chunk_duplicate_pairs) > 0:
         print(f"   📊 Found: {len(chunk_duplicate_pairs)} pairs within chunk, {cross_chunk_pairs_count} cross-chunk pairs")
     
     # ============================================================
     # IMPROVEMENT 1: Handle cross-chunk pairs immediately
     # ============================================================
+    # Helper function to extract numeric part from job_id (e.g., "url_14814" -> 14814)
+    def extract_job_id_number(job_id: str) -> int:
+        """Extract numeric part from job_id like 'url_14814' -> 14814"""
+        try:
+            # Extract number after last underscore
+            parts = job_id.split('_')
+            if len(parts) > 1:
+                return int(parts[-1])
+            # If no underscore, try to extract number from end
+            import re
+            match = re.search(r'\d+$', job_id)
+            if match:
+                return int(match.group())
+            # Fallback: use string comparison
+            return 0
+        except:
+            # Fallback: use string comparison
+            return 0
+    
     # Track videos that should be marked as duplicates due to cross-chunk pairs
-    # If a video in current chunk has a duplicate with smaller job_id in another chunk,
-    # mark it as duplicate
+    # CRITICAL FIX: If a video in current chunk has a duplicate with ANY video outside chunk,
+    # we need to check if the outside video has a smaller job_id. If yes, mark current video as duplicate.
+    # If the outside video has a larger job_id, we still mark current video as duplicate (because original is outside).
     cross_chunk_duplicates: Set[str] = set()
     cross_chunk_originals: Dict[str, Tuple[str, float]] = {}  # job_id -> (original_job_id, similarity)
     
+    # DEBUG: Track statistics
+    pairs_with_duplicate_in_chunk = 0
+    pairs_with_original_in_chunk = 0
+    
     for job_id1, job_id2, similarity in cross_chunk_pairs_list:
-        # Determine which is original (smaller job_id)
-        if job_id1 < job_id2:
-            original_id, duplicate_id = job_id1, job_id2
-        else:
-            original_id, duplicate_id = job_id2, job_id1
+        # Determine which is original (smaller numeric job_id)
+        # Extract numbers for proper comparison
+        num1 = extract_job_id_number(job_id1)
+        num2 = extract_job_id_number(job_id2)
         
-        # If duplicate is in current chunk and original is outside
+        if num1 > 0 and num2 > 0:
+            # Both have valid numbers, compare numerically
+            if num1 < num2:
+                original_id, duplicate_id = job_id1, job_id2
+            else:
+                original_id, duplicate_id = job_id2, job_id1
+        else:
+            # Fallback to string comparison
+            if job_id1 < job_id2:
+                original_id, duplicate_id = job_id1, job_id2
+            else:
+                original_id, duplicate_id = job_id2, job_id1
+        
+        # Track statistics
+        if duplicate_id in all_job_ids:
+            pairs_with_duplicate_in_chunk += 1
+        if original_id in all_job_ids:
+            pairs_with_original_in_chunk += 1
+        
+        # CRITICAL FIX: If duplicate is in current chunk and original is outside, mark as duplicate
+        # Also: If original is in current chunk but duplicate is outside, we don't mark anything
+        # (because we want to keep the original in current chunk)
         if duplicate_id in all_job_ids and original_id not in all_job_ids:
             cross_chunk_duplicates.add(duplicate_id)
             # Store the best similarity for this duplicate
             if duplicate_id not in cross_chunk_originals or similarity > cross_chunk_originals[duplicate_id][1]:
                 cross_chunk_originals[duplicate_id] = (original_id, similarity)
+        # NEW: Also handle case where original is in chunk but duplicate is outside
+        # In this case, we keep the original in chunk (no action needed)
+    
+    # DEBUG: Print statistics
+    print(f"   🔍 DEBUG: Cross-chunk pairs analysis:")
+    print(f"      - Total cross-chunk pairs: {len(cross_chunk_pairs_list)}")
+    print(f"      - Pairs with duplicate in chunk: {pairs_with_duplicate_in_chunk}")
+    print(f"      - Pairs with original in chunk: {pairs_with_original_in_chunk}")
+    print(f"      - Unique duplicates marked: {len(cross_chunk_duplicates)}")
     
     if cross_chunk_duplicates:
         print(f"   🔗 Marked {len(cross_chunk_duplicates)} videos as duplicates (original in other chunk)")
+        # Show sample cross-chunk duplicates
+        sample_dups = list(cross_chunk_duplicates)[:5]
+        for dup_id in sample_dups:
+            orig_id, sim = cross_chunk_originals[dup_id]
+            print(f"      Example: {dup_id} -> original {orig_id} (sim={sim:.4f})")
     
     # ============================================================
     # Build graph for within-chunk clustering
@@ -700,19 +1121,35 @@ def search_duplicates_aggregated(
         if (cluster_idx + 1) % 10 == 0 or cluster_idx == 0:
             print(f"      Processing cluster {cluster_idx + 1}/{len(clusters)} (size: {len(cluster)})")
         
+        # CRITICAL FIX: Exclude cross-chunk duplicates from cluster processing
+        # If a video is already marked as cross-chunk duplicate, skip it
+        cluster_filtered = [jid for jid in cluster if jid not in cross_chunk_duplicates]
+        
+        if not cluster_filtered:
+            # All videos in cluster are cross-chunk duplicates, skip
+            continue
+        
         # IMPROVEMENT: Sort by job_id to get smallest (will be consistent across chunks)
-        sorted_cluster = sorted(cluster)
-        original_job_id = sorted_cluster[0]  # Smallest job_id = original
-        originals.add(original_job_id)
+        # Sort by numeric job_id (not string) to find true original
+        sorted_cluster = sorted(cluster_filtered, key=lambda jid: extract_job_id_number(jid))
+        original_job_id = sorted_cluster[0]  # Smallest numeric job_id = original
         
-        # Add original to unique videos
-        unique_videos.append({
-            "url": video_info[original_job_id]["url"],
-            "job_id": original_job_id
-        })
+        # CRITICAL: Only add to originals if not already a cross-chunk duplicate
+        if original_job_id not in cross_chunk_duplicates:
+            originals.add(original_job_id)
+            
+            # Add original to unique videos
+            unique_videos.append({
+                "url": video_info[original_job_id]["url"],
+                "job_id": original_job_id
+            })
         
-        # Add all others as duplicates
+        # Add all others as duplicates (both within-cluster and cross-chunk duplicates in cluster)
         for duplicate_job_id in sorted_cluster[1:]:
+            # Skip if already marked as cross-chunk duplicate (will be added separately)
+            if duplicate_job_id in cross_chunk_duplicates:
+                continue
+                
             # OPTIMIZATION: Use lookup dict instead of searching through all pairs
             key = tuple(sorted([duplicate_job_id, original_job_id]))
             max_sim = similarity_lookup.get(key, 0.0)
@@ -726,15 +1163,18 @@ def search_duplicates_aggregated(
             })
     
     # BUG FIX: Add videos that have no duplicates (not in any cluster and not cross-chunk duplicate)
+    # CRITICAL: Only add standalone videos that are NOT cross-chunk duplicates
     standalone_videos = all_job_ids - videos_in_clusters - cross_chunk_duplicates
     if standalone_videos:
         print(f"   ℹ️  Found {len(standalone_videos)} standalone videos (no duplicates)")
-        for job_id in sorted(standalone_videos):
-            unique_videos.append({
-                "url": video_info[job_id]["url"],
-                "job_id": job_id
-            })
-            originals.add(job_id)
+        for job_id in sorted(standalone_videos, key=lambda jid: extract_job_id_number(jid)):
+            # Double-check: not a cross-chunk duplicate
+            if job_id not in cross_chunk_duplicates:
+                unique_videos.append({
+                    "url": video_info[job_id]["url"],
+                    "job_id": job_id
+                })
+                originals.add(job_id)
     else:
         print(f"   ℹ️  No standalone videos (all {len(all_job_ids)} videos have duplicates)")
     
@@ -838,6 +1278,17 @@ def search_duplicates_aggregated(
     print(f"✅ Results written!")
     print(f"   Unique videos: {len(final_unique_videos)}")
     print(f"   Duplicates: {len(duplicates)}")
+    
+    # DEBUG: Show breakdown
+    if chunk_start is not None and chunk_end is not None:
+        print(f"\n📊 CHUNK MODE SUMMARY:")
+        print(f"   Input chunk size: {chunk_end - chunk_start} videos")
+        print(f"   Unique videos in chunk: {len(final_unique_videos)}")
+        print(f"   Duplicates found: {len(duplicates)}")
+        if chunk_end > chunk_start:
+            dedup_rate = (1 - len(final_unique_videos) / (chunk_end - chunk_start)) * 100
+            print(f"   Deduplication rate: {dedup_rate:.1f}%")
+        # Note: cross_chunk_duplicates is defined in the cross-chunk processing section above
     
     if tracker:
         tracker.end_phase()
