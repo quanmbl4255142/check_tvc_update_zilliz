@@ -1,0 +1,411 @@
+═══════════════════════════════════════════════════════════════════════════════
+                    FLOWCHART: LUỒNG LỌC TRÙNG
+              search_duplicates_aggregated.py
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 1: LOAD DATA                                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    [START]
+      │
+      ▼
+    ┌─────────────────────┐
+    │ Connect to Milvus   │
+    │ Load Collection     │
+    └─────────────────────┘
+      │
+      ├─── Chunk Mode? ────┐
+      │                    │
+      ▼                    ▼
+  ┌──────────┐      ┌──────────────┐
+  │ Query by │      │ Query All    │
+  │ job_id    │      │ Videos       │
+  │ range     │      │              │
+  └──────────┘      └──────────────┘
+      │                    │
+      └──────────┬───────────┘
+                 ▼
+        ┌─────────────────────┐
+        │ all_data = [        │
+        │   {job_id, url,     │
+        │    embedding}, ...] │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Build video_info    │
+        │ map: job_id →       │
+        │ {url, embedding}    │
+        └─────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 2: PRE-FILTERING (URL-based Deduplication)                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ --skip_url_dedup?   │
+        └─────────────────────┘
+                 │
+        ┌────────┴────────┐
+        │                 │
+        ▼                 ▼
+    [SKIP]          [PRE-FILTER]
+        │                 │
+        │                 ▼
+        │         ┌─────────────────────┐
+        │         │ Extract Video ID    │
+        │         │ - Google CDN:       │
+        │         │   gcdn_id_XXX       │
+        │         │ - YouTube:          │
+        │         │   youtube_XXX       │
+        │         └─────────────────────┘
+        │                 │
+        │                 ▼
+        │         ┌─────────────────────┐
+        │         │ Group by Video ID   │
+        │         │ video_id_groups     │
+        │         └─────────────────────┘
+        │                 │
+        │                 ▼
+        │         ┌─────────────────────┐
+        │         │ Chunk Mode?         │
+        │         └─────────────────────┘
+        │                 │
+        │         ┌────────┴────────┐
+        │         │                 │
+        │         ▼                 ▼
+        │    ┌──────────┐    ┌──────────────┐
+        │    │ Check    │    │ Select Best  │
+        │    │ Cross-   │    │ Video        │
+        │    │ chunk    │    │              │
+        │    │ Video ID │    │              │
+        │    └──────────┘    └──────────────┘
+        │         │                 │
+        │         ▼                 │
+        │    ┌──────────┐           │
+        │    │ Remove   │           │
+        │    │ Groups   │           │
+        │    │ existing │           │
+        │    │ in other │           │
+        │    │ chunks   │           │
+        │    └──────────┘           │
+        │         │                 │
+        │         └────────┬───────┘
+        │                  ▼
+        │         ┌─────────────────────┐
+        │         │ Select Best Video:   │
+        │         │ 1. Highest itag     │
+        │         │ 2. Smallest job_id  │
+        │         └─────────────────────┘
+        │                  │
+        │                  ▼
+        │         ┌─────────────────────┐
+        │         │ Remove URL           │
+        │         │ Duplicates           │
+        │         │ Keep 1 video/group   │
+        │         └─────────────────────┘
+        │                  │
+        └──────────────────┘
+                 │
+                 ▼
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 3: PASS 1 - TÌM DUPLICATE PAIRS                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Divide into batches │
+        │ batch_size = 10 max │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Parallel Search     │
+        │ Multiple threads     │
+        │ Search on Milvus     │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Collect Pairs:       │
+        │ (job_id1, job_id2,  │
+        │  similarity)        │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Filter:              │
+        │ similarity >=        │
+        │ threshold            │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Normalize Pairs:    │
+        │ Sort job_ids        │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Separate Pairs:     │
+        │ - within-chunk      │
+        │ - cross-chunk       │
+        └─────────────────────┘
+                 │
+                 ▼
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 4: PASS 2 - CLUSTERING & CHỌN ORIGINALS                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Process Cross-chunk │
+        │ Duplicates          │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ similarity >=       │
+        │ cross_chunk_        │
+        │ threshold (0.98)?   │
+        └─────────────────────┘
+                 │
+        ┌────────┴────────┐
+        │                 │
+        ▼                 ▼
+    [Skip Pair]    [Mark as Duplicate]
+        │                 │
+        │                 ▼
+        │         ┌─────────────────────┐
+        │         │ Store:              │
+        │         │ cross_chunk_        │
+        │         │ duplicates          │
+        │         └─────────────────────┘
+        │                 │
+        └─────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Build Graph:        │
+        │ job_id → neighbors  │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Build Similarity    │
+        │ Lookup Dictionary   │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ DFS with Path       │
+        │ Validation:         │
+        │ - Max path = 3      │
+        │ - Path sim >=       │
+        │   threshold × 0.9   │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Find Clusters:      │
+        │ Connected           │
+        │ Components          │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ For each Cluster:   │
+        │ 1. Sort by job_id   │
+        │ 2. Select smallest  │
+        │    = original       │
+        │ 3. Others = dupes   │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Add Standalone      │
+        │ Videos (no cluster) │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Add Cross-chunk     │
+        │ Duplicates to list  │
+        └─────────────────────┘
+                 │
+                 ▼
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 5: AUTO-CLEAN (Optional)                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ --auto_clean?       │
+        └─────────────────────┘
+                 │
+        ┌────────┴────────┐
+        │                 │
+        ▼                 ▼
+    [Skip]          [Validate URLs]
+        │                 │
+        │                 ▼
+        │         ┌─────────────────────┐
+        │         │ Check:              │
+        │         │ - PNG/images        │
+        │         │ - URLs quá ngắn    │
+        │         │ - No video indicator│
+        │         └─────────────────────┘
+        │                 │
+        │                 ▼
+        │         ┌─────────────────────┐
+        │         │ Separate:           │
+        │         │ - Valid URLs        │
+        │         │ - Invalid URLs      │
+        │         └─────────────────────┘
+        │                 │
+        └─────────────────┘
+                 │
+                 ▼
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 6: WRITE RESULTS                                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Write unique_csv:   │
+        │ List of unique URLs │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Write report_csv:   │
+        │ Duplicates report   │
+        │ with original       │
+        │ mapping             │
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Write invalid_csv:  │
+        │ Invalid URLs report │
+        │ (if auto-clean)     │
+        └─────────────────────┘
+                 │
+                 ▼
+              [END]
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                          CÁC ĐIỂM QUYẾT ĐỊNH QUAN TRỌNG
+═══════════════════════════════════════════════════════════════════════════════
+
+1. PRE-FILTERING DECISION:
+   ┌─────────────────────────────────────┐
+   │ --skip_url_dedup?                   │
+   │   ├─ YES → Skip, keep all videos   │
+   │   └─ NO  → Filter by Video ID      │
+   └─────────────────────────────────────┘
+
+2. CROSS-CHUNK DECISION:
+   ┌─────────────────────────────────────┐
+   │ Video ID exists in other chunk?      │
+   │   ├─ YES → Remove entire group       │
+   │   └─ NO  → Keep and process         │
+   └─────────────────────────────────────┘
+
+3. SIMILARITY THRESHOLD:
+   ┌─────────────────────────────────────┐
+   │ similarity >= threshold?             │
+   │   ├─ YES → Mark as duplicate pair   │
+   │   └─ NO  → Skip pair                 │
+   └─────────────────────────────────────┘
+
+4. CROSS-CHUNK THRESHOLD:
+   ┌─────────────────────────────────────┐
+   │ similarity >= cross_chunk_threshold? │
+   │   (default: 0.98)                    │
+   │   ├─ YES → Mark as cross-chunk dup  │
+   │   └─ NO  → Skip                      │
+   └─────────────────────────────────────┘
+
+5. PATH VALIDATION:
+   ┌─────────────────────────────────────┐
+   │ Path similarity >= threshold × 0.9?  │
+   │   ├─ YES → Add to cluster           │
+   │   └─ NO  → Stop path                │
+   └─────────────────────────────────────┘
+
+6. AUTO-CLEAN DECISION:
+   ┌─────────────────────────────────────┐
+   │ --auto_clean?                       │
+   │   ├─ YES → Validate and filter URLs │
+   │   └─ NO  → Keep all URLs            │
+   └─────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                          DATA STRUCTURES
+═══════════════════════════════════════════════════════════════════════════════
+
+all_data:           List[{job_id, url, embedding}]
+video_info:         Dict[job_id → {url, embedding}]
+video_id_groups:    Dict[video_id → List[job_ids]]
+duplicate_pairs:    List[(job_id1, job_id2, similarity)]
+chunk_duplicate_pairs:  List[(job_id1, job_id2, similarity)]
+cross_chunk_pairs:  List[(job_id1, job_id2, similarity)]
+graph:              Dict[job_id → Set[neighbor_job_ids]]
+clusters:           List[Set[job_ids]]
+originals:          Set[job_id]
+unique_videos:      List[{url, job_id}]
+duplicates:          List[{duplicate_url, duplicate_job_id, 
+                          original_job_id, original_url, similarity}]
+cross_chunk_duplicates: Set[job_id]
+cross_chunk_originals:  Dict[job_id → (original_job_id, similarity)]
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                          CRITICAL LOGIC POINTS
+═══════════════════════════════════════════════════════════════════════════════
+
+1. PRE-FILTERING:
+   - Extract Video ID từ URL (Google CDN, YouTube)
+   - Group videos có cùng Video ID
+   - Chọn video tốt nhất: highest itag → smallest job_id
+   - Loại bỏ các videos còn lại trong group
+
+2. CROSS-CHUNK CHECK:
+   - Query videos ngoài chunk hiện tại
+   - Nếu Video ID đã tồn tại với job_id nhỏ hơn → remove group
+
+3. CLUSTERING:
+   - Build graph từ duplicate pairs
+   - DFS với path validation để tránh transitive closure
+   - Max path length = 3
+   - Path similarity phải >= threshold × 0.9
+
+4. SELECT ORIGINAL:
+   - Trong mỗi cluster: sort by numeric job_id
+   - Chọn job_id nhỏ nhất làm original
+   - Các videos còn lại → duplicates
+
+5. STANDALONE VIDEOS:
+   - Videos không trong cluster nào
+   - Không phải cross-chunk duplicate
+   - → Thêm vào unique_videos
+
