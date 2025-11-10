@@ -251,6 +251,107 @@ def extract_itag_from_url(url: str) -> int:
     return 0
 
 
+def extract_resolution_from_url(url: str) -> tuple[int, int]:
+    """
+    Extract video resolution (width, height) from URL
+    Returns (width, height) or (0, 0) if not found
+    
+    Tries multiple methods:
+    1. Extract from itag (Google CDN)
+    2. Extract from URL pattern (e.g., 1920x1080, 1080p, play_1080p.mp4)
+    3. Extract from filename patterns
+    """
+    if not url:
+        return (0, 0)
+    
+    url = url.strip().strip('"').strip("'")
+    url_lower = url.lower()
+    
+    # Method 1: Extract from itag (Google CDN)
+    itag = extract_itag_from_url(url)
+    if itag > 0:
+        # Map itag to resolution (common YouTube/Google CDN itags)
+        itag_to_resolution = {
+            # 4K
+            348: (3840, 2160),  # 4K/2160p
+            347: (3840, 2160),  # 4K/2160p
+            # 1080p
+            37: (1920, 1080),   # 1080p
+            38: (1920, 1080),   # 1080p
+            343: (1920, 1080),  # 1080p
+            342: (1920, 1080),  # 1080p
+            # 720p
+            22: (1280, 720),    # 720p
+            39: (1280, 720),    # 720p
+            346: (1280, 720),   # 720p
+            # 480p
+            35: (854, 480),     # 480p
+            # 360p
+            18: (640, 360),     # 360p
+        }
+        if itag in itag_to_resolution:
+            return itag_to_resolution[itag]
+    
+    # Method 2: Extract from URL pattern (e.g., 1920x1080, 1920_1080)
+    match = re.search(r'(\d+)[x_](\d+)', url, re.IGNORECASE)
+    if match:
+        try:
+            width = int(match.group(1))
+            height = int(match.group(2))
+            # Sanity check: reasonable video dimensions
+            if 100 <= width <= 7680 and 100 <= height <= 4320:
+                return (width, height)
+        except:
+            pass
+    
+    # Method 3: Extract from resolution indicators (1080p, 720p, 4k, etc.)
+    # Check for patterns like "1080p", "720p", "4k", "2160p"
+    resolution_patterns = {
+        r'2160p|4k|3840x2160': (3840, 2160),
+        r'1440p|2560x1440': (2560, 1440),
+        r'1080p|1920x1080': (1920, 1080),
+        r'720p|1280x720': (1280, 720),
+        r'480p|854x480': (854, 480),
+        r'360p|640x360': (640, 360),
+        r'240p|426x240': (426, 240),
+    }
+    
+    for pattern, (w, h) in resolution_patterns.items():
+        if re.search(pattern, url_lower):
+            return (w, h)
+    
+    # Method 4: Check filename patterns (e.g., play_1080p.mp4)
+    filename_patterns = {
+        r'play_1080p|1080p\.mp4': (1920, 1080),
+        r'play_720p|720p\.mp4': (1280, 720),
+        r'play_480p|480p\.mp4': (854, 480),
+        r'play_360p|360p\.mp4': (640, 360),
+    }
+    
+    for pattern, (w, h) in filename_patterns.items():
+        if re.search(pattern, url_lower):
+            return (w, h)
+    
+    return (0, 0)
+
+
+def get_resolution_score(url: str) -> int:
+    """
+    Get a numeric score representing video resolution quality
+    Higher score = better quality
+    Returns: score (0 = unknown, higher = better)
+    """
+    width, height = extract_resolution_from_url(url)
+    if width == 0 or height == 0:
+        # Fallback to itag if available
+        itag = extract_itag_from_url(url)
+        return itag  # Use itag as score (higher itag usually = better quality)
+    
+    # Calculate score: width * height (pixel count)
+    # This gives higher score to higher resolution
+    return width * height
+
+
 def extract_video_id_from_url(url: str) -> str:
     """
     Extract video ID from URL (e.g., YouTube, Google CDN, etc.)
@@ -1755,10 +1856,30 @@ def search_duplicates_aggregated(
             # All videos in cluster are cross-chunk duplicates, skip
             continue
         
-        # IMPROVEMENT: Sort by job_id to get smallest (will be consistent across chunks)
-        # Sort by numeric job_id (not string) to find true original
-        sorted_cluster = sorted(cluster_filtered, key=lambda jid: extract_job_id_number(jid))
-        original_job_id = sorted_cluster[0]  # Smallest numeric job_id = original
+        # CRITICAL FIX: Sort by resolution quality (highest first), then by job_id (smallest as tiebreaker)
+        # This ensures we keep the best quality version (e.g., 1920x1080) when multiple resolutions exist
+        def get_video_quality_score(job_id: str) -> tuple:
+            """Get quality score for sorting: (resolution_score, job_id_num)"""
+            url = video_info[job_id]["url"]
+            resolution_score = get_resolution_score(url)
+            job_id_num = extract_job_id_number(job_id)
+            # Return tuple: (-resolution_score for descending, job_id_num for ascending)
+            # Negative resolution_score so higher resolution comes first
+            return (-resolution_score, job_id_num)
+        
+        sorted_cluster = sorted(cluster_filtered, key=get_video_quality_score)
+        original_job_id = sorted_cluster[0]  # Highest resolution (or smallest job_id if same resolution)
+        
+        # DEBUG: Log which video was selected and why
+        original_url = video_info[original_job_id]["url"]
+        original_resolution = extract_resolution_from_url(original_url)
+        original_itag = extract_itag_from_url(original_url)
+        if original_resolution[0] > 0:
+            print(f"      → Selected {original_job_id} as original (resolution: {original_resolution[0]}x{original_resolution[1]}, itag: {original_itag}) from cluster of {len(cluster_filtered)} videos")
+        elif original_itag > 0:
+            print(f"      → Selected {original_job_id} as original (itag: {original_itag}) from cluster of {len(cluster_filtered)} videos")
+        else:
+            print(f"      → Selected {original_job_id} as original (no resolution info, smallest job_id) from cluster of {len(cluster_filtered)} videos")
         
         # CRITICAL: Only add to originals if not already a cross-chunk duplicate
         if original_job_id not in cross_chunk_duplicates:
