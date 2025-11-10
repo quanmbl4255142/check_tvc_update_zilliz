@@ -1450,6 +1450,17 @@ def search_duplicates_aggregated(
     
     print(f"   ✅ Found {len(clusters)} clusters (excluding cross-chunk duplicates)")
     
+    # DEBUG: Show cluster size distribution
+    if clusters:
+        cluster_sizes = [len(c) for c in clusters]
+        cluster_sizes.sort(reverse=True)
+        print(f"   📊 Cluster size distribution:")
+        print(f"      - Largest cluster: {cluster_sizes[0]} videos")
+        print(f"      - Top 5 largest: {cluster_sizes[:5]}")
+        print(f"      - Total videos in clusters: {sum(cluster_sizes)}")
+        if len(cluster_sizes) > 10:
+            print(f"      - Smallest 5 clusters: {cluster_sizes[-5:]}")
+    
     # ============================================================
     # IMPROVEMENT 2: Select original based on smallest job_id in entire collection
     # ============================================================
@@ -1476,9 +1487,18 @@ def search_duplicates_aggregated(
     
     # Process clusters with progress tracking
     print(f"   🔄 Processing {len(clusters)} clusters...")
+    
+    # CRITICAL: Detect suspiciously large clusters (likely transitive closure issue)
+    MAX_CLUSTER_SIZE_WARNING = 1000  # Warn if cluster > 1000 videos
+    large_clusters = []
+    
     for cluster_idx, cluster in enumerate(clusters):
         if (cluster_idx + 1) % 10 == 0 or cluster_idx == 0:
             print(f"      Processing cluster {cluster_idx + 1}/{len(clusters)} (size: {len(cluster)})")
+        
+        # Detect large clusters
+        if len(cluster) > MAX_CLUSTER_SIZE_WARNING:
+            large_clusters.append((cluster_idx, len(cluster), list(cluster)[:5]))  # Store first 5 job_ids as sample
         
         # CRITICAL FIX: Exclude cross-chunk duplicates from cluster processing
         # If a video is already marked as cross-chunk duplicate, skip it
@@ -1550,6 +1570,17 @@ def search_duplicates_aggregated(
     
     within_chunk_duplicates = len(duplicates) - len(cross_chunk_duplicates)
     print(f"   ✅ Selected {len(originals)} originals, {within_chunk_duplicates} within-chunk duplicates, {len(cross_chunk_duplicates)} cross-chunk duplicates")
+    
+    # Warn about large clusters
+    if large_clusters:
+        print(f"\n   ⚠️  WARNING: Found {len(large_clusters)} suspiciously large clusters (> {MAX_CLUSTER_SIZE_WARNING} videos):")
+        for cluster_idx, size, sample_ids in large_clusters:
+            print(f"      - Cluster {cluster_idx + 1}: {size} videos (sample: {sample_ids})")
+        print(f"   💡 This might be caused by:")
+        print(f"      1. Transitive closure: Videos connected through chain (A-B, B-C, C-D → all in one cluster)")
+        print(f"      2. Same video ID: Videos with same Google CDN/YouTube ID but different itag/signature")
+        print(f"      3. Threshold too low: Similarity threshold {similarity_threshold} might be too low")
+        print(f"   💡 SOLUTION: Remove --skip_url_dedup flag to enable pre-filtering by video ID")
     
     if tracker:
         tracker.end_phase()
