@@ -1,6 +1,6 @@
 """
-Upload AGGREGATED vectors to Milvus - Tối ưu cho Zilliz
-Thay vì upload 3 frames riêng lẻ, tính 1 vector đại diện từ 3 frames
+Upload video embeddings to Milvus - 1 frame per video
+Load first_frame.npy and upload to Zilliz (1 vector per video)
 """
 
 import argparse
@@ -41,46 +41,27 @@ def load_url(job_dir: str) -> str:
         return ""
 
 
-def load_and_aggregate_embeddings(job_dir: str, method="average") -> np.ndarray:
+def load_embedding(job_dir: str) -> np.ndarray:
     """
-    Load all frames and aggregate into single vector
+    Load first frame embedding from job directory
     
-    Args:
-        method: 'average' (trung bình) or 'max' (max pooling)
+    Returns:
+        Normalized embedding vector (512 dims) or None if not found
     """
-    frame_files = ["first_frame.npy", "middle_frame.npy", "last_frame.npy"]
-    vectors = []
+    npy_path = os.path.join(job_dir, "first_frame.npy")
     
-    for fname in frame_files:
-        npy_path = os.path.join(job_dir, fname)
-        if os.path.exists(npy_path):
-            try:
-                vec = np.load(npy_path).astype(np.float32).flatten()
-                # L2 normalize
-                norm = np.linalg.norm(vec)
-                if norm > 0:
-                    vec = vec / norm
-                vectors.append(vec)
-            except Exception:
-                pass
-    
-    if not vectors:
+    if not os.path.exists(npy_path):
         return None
     
-    # Aggregate
-    if method == "average":
-        aggregated = np.mean(vectors, axis=0)
-    elif method == "max":
-        aggregated = np.max(vectors, axis=0)
-    else:
-        raise ValueError(f"Unknown method: {method}")
-    
-    # Re-normalize
-    norm = np.linalg.norm(aggregated)
-    if norm > 0:
-        aggregated = aggregated / norm
-    
-    return aggregated.astype(np.float32)
+    try:
+        vec = np.load(npy_path).astype(np.float32).flatten()
+        # L2 normalize for cosine similarity (using IP metric)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        return vec
+    except Exception:
+        return None
 
 
 def create_collection_if_not_exists(collection_name: str) -> Collection:
@@ -118,13 +99,13 @@ def create_collection_if_not_exists(collection_name: str) -> Collection:
             name="embedding",
             dtype=DataType.FLOAT_VECTOR,
             dim=EMBEDDING_DIM,
-            description="Aggregated CLIP embedding from multiple frames"
+            description="CLIP embedding from first frame"
         ),
     ]
     
     schema = CollectionSchema(
         fields,
-        description="Aggregated video embeddings (1 vector per video)"
+        description="Video embeddings (1 vector per video, first frame only)"
     )
     
     collection = Collection(
@@ -145,13 +126,12 @@ def create_collection_if_not_exists(collection_name: str) -> Collection:
     return collection
 
 
-def upload_aggregated_vectors(
+def upload_vectors(
     batch_outputs_dir: str,
     collection_name: str,
-    aggregation_method: str = "average",
     overwrite: bool = False
 ) -> Tuple[int, int]:
-    """Upload aggregated vectors to Milvus"""
+    """Upload video embeddings to Milvus (1 frame per video)"""
     
     print("🔌 Connecting to Milvus...")
     params = get_connection_params()
@@ -181,7 +161,6 @@ def upload_aggregated_vectors(
         return 0, 0
     
     print(f"\n📁 Found {len(job_dirs)} job directories")
-    print(f"🔄 Aggregation method: {aggregation_method}")
     print(f"📤 Starting upload (batch size: {BATCH_SIZE})...\n")
     
     # Prepare data for batch insert
@@ -200,17 +179,17 @@ def upload_aggregated_vectors(
             skipped += 1
             continue
         
-        # Load and aggregate embeddings
-        aggregated_vec = load_and_aggregate_embeddings(job_dir, method=aggregation_method)
+        # Load embedding from first frame
+        embedding_vec = load_embedding(job_dir)
         
-        if aggregated_vec is None:
+        if embedding_vec is None:
             skipped += 1
             print(f"⚠️  [{idx+1}/{len(job_dirs)}] {job_id} - No embeddings found")
             continue
         
         urls.append(url)
         job_ids.append(job_id)
-        embeddings.append(aggregated_vec.tolist())
+        embeddings.append(embedding_vec.tolist())
         total_videos += 1
         
         # Batch insert
@@ -244,14 +223,14 @@ def upload_aggregated_vectors(
     print(f"\n✅ Upload complete!")
     print(f"   Total vectors: {final_count}")
     print(f"   Skipped: {skipped}")
-    print(f"   Aggregation: {aggregation_method}")
+    print(f"   Mode: 1 frame per video (first_frame.npy)")
     
     return final_count, skipped
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Upload AGGREGATED video embeddings to Milvus (1 vector per video)"
+        description="Upload video embeddings to Milvus (1 vector per video, first frame only)"
     )
     parser.add_argument(
         "--root",
@@ -260,14 +239,8 @@ def main():
     )
     parser.add_argument(
         "--collection",
-        default="video_dedup_aggregated",
-        help="Collection name (default: video_dedup_aggregated)"
-    )
-    parser.add_argument(
-        "--method",
-        choices=["average", "max"],
-        default="average",
-        help="Aggregation method: average (trung bình) or max (max pooling) (default: average)"
+        default="video_dedup",
+        help="Collection name (default: video_dedup)"
     )
     parser.add_argument(
         "--overwrite",
@@ -283,10 +256,9 @@ def main():
     
     # Print config
     print_config()
-    print(f"\n🎯 Aggregation strategy: {args.method}")
-    print(f"   → Combines 3 frames into 1 vector")
-    print(f"   → Storage: 460 vectors instead of 1380 (67% reduction)")
-    print(f"   → Query: 3× faster")
+    print(f"\n🎯 Upload mode: 1 frame per video")
+    print(f"   → Loads first_frame.npy from each job directory")
+    print(f"   → 1 vector per video (simple and fast)")
     
     if args.config_only:
         return
@@ -298,19 +270,15 @@ def main():
     
     # Upload
     try:
-        total, skipped = upload_aggregated_vectors(
+        total, skipped = upload_vectors(
             args.root,
             args.collection,
-            args.method,
             args.overwrite
         )
         
         if total > 0:
-            print(f"\n🎉 Successfully uploaded {total} aggregated vectors!")
-            print(f"\n💡 PERFORMANCE COMPARISON:")
-            print(f"   Old way: {total * 3} vectors (3 frames per video)")
-            print(f"   New way: {total} vectors (aggregated)")
-            print(f"   Saved: {total * 2} vectors ({(total * 2) / (total * 3) * 100:.1f}% reduction)")
+            print(f"\n🎉 Successfully uploaded {total} vectors!")
+            print(f"   → 1 vector per video (from first_frame.npy)")
         else:
             print("\n⚠️  No vectors were uploaded.")
             
