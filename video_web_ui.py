@@ -48,7 +48,7 @@ def submit_video():
         response = requests.post(
             API_VIDEO_ENDPOINT,
             json={"video_url": video_url},
-            timeout=10  # Giảm timeout xuống 10 giây (vì đã dùng acks=0 nên nhanh hơn)
+            timeout=30  # Tăng timeout lên 30 giây vì Kafka có thể mất thời gian
         )
         
         if response.status_code == 200:

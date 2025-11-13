@@ -25,39 +25,82 @@ KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "video_processing")
 producer = None
 
 def ensure_topic_exists():
-    """Đảm bảo topic tồn tại, nếu chưa thì tạo (bỏ qua nếu Kafka chưa sẵn sàng)"""
-    # Với KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, topic sẽ tự động được tạo
-    # Nên không cần tạo topic trước, chỉ log thông tin
-    console.print(f"[cyan]📨 Topic '{KAFKA_TOPIC}' will be auto-created on first message[/cyan]")
-    return
+    """Đảm bảo topic tồn tại"""
+    try:
+        admin_client = KafkaAdminClient(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            client_id='video_api_admin',
+            request_timeout_ms=5000
+        )
+        # Kiểm tra topic có tồn tại không
+        try:
+            topics = admin_client.list_topics(timeout_ms=5000)
+            # list_topics() trả về set hoặc list
+            if isinstance(topics, set):
+                topic_exists = KAFKA_TOPIC in topics
+            else:
+                topic_exists = KAFKA_TOPIC in list(topics)
+        except:
+            topic_exists = False
+        
+        if not topic_exists:
+            # Tạo topic mới
+            topic = NewTopic(
+                name=KAFKA_TOPIC,
+                num_partitions=1,
+                replication_factor=1
+            )
+            try:
+                admin_client.create_topics([topic], timeout_ms=5000)
+                console.print(f"[green]✅ Created topic: {KAFKA_TOPIC}[/green]")
+            except TopicAlreadyExistsError:
+                console.print(f"[dim]Topic {KAFKA_TOPIC} already exists[/dim]")
+        else:
+            console.print(f"[dim]Topic {KAFKA_TOPIC} already exists[/dim]")
+        admin_client.close()
+    except Exception as e:
+        # Nếu không tạo được, Kafka sẽ auto-create khi có message đầu tiên
+        console.print(f"[yellow]⚠️  Could not ensure topic exists: {e}[/yellow]")
+        console.print(f"[dim]   Topic will be auto-created on first message[/dim]")
 
 def get_kafka_producer():
-    """Lazy initialization of Kafka producer"""
+    """Lazy initialization of Kafka producer với retry logic"""
     global producer
     if producer is None:
-        try:
-            # Đảm bảo topic tồn tại trước
-            ensure_topic_exists()
-            
-            producer = KafkaProducer(
-                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-                key_serializer=lambda k: k.encode('utf-8') if k else None,
-                acks=0,  # Fire and forget - không đợi confirmation (nhanh nhất)
-                retries=0,  # Không retry để tránh timeout
-                max_in_flight_requests_per_connection=1,
-                request_timeout_ms=5000,  # 5 seconds
-                metadata_max_age_ms=300000,  # 5 minutes
-                api_version=(0, 10, 1),  # Specify API version
-                linger_ms=0,  # Gửi ngay lập tức
-                batch_size=0,  # Không batch
-                max_block_ms=5000  # Max time to block when metadata unavailable
-            )
-            console.print(f"[green]✅ Kafka producer connected to {KAFKA_BOOTSTRAP_SERVERS}[/green]")
-        except Exception as e:
-            console.print(f"[red]❌ Failed to connect to Kafka: {e}[/red]")
-            console.print(f"[yellow]💡 Đảm bảo Kafka đang chạy: docker-compose up -d trong thư mục kafka[/yellow]")
-            raise
+        import time
+        max_retries = 3
+        retry_delay = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Bỏ ensure_topic_exists() vì có thể gây lỗi
+                # Kafka sẽ tự tạo topic với KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+                
+                producer = KafkaProducer(
+                    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                    key_serializer=lambda k: k.encode('utf-8') if k else None,
+                    acks=1,  # Đợi leader xác nhận - đảm bảo message được gửi
+                    retries=3,  # Retry 3 lần nếu lỗi
+                    max_in_flight_requests_per_connection=1,
+                    request_timeout_ms=10000,  # Tăng timeout lên 10 giây
+                    metadata_max_age_ms=300000,
+                    linger_ms=0,  # Gửi ngay
+                    batch_size=0,  # Không batch
+                    max_block_ms=10000,  # Tăng block time lên 10 giây
+                    api_version=(0, 10, 1)  # Chỉ định API version để tránh auto-detect timeout
+                )
+                console.print(f"[green]✅ Kafka producer connected to {KAFKA_BOOTSTRAP_SERVERS}[/green]")
+                break  # Thành công, thoát khỏi retry loop
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    console.print(f"[yellow]⚠️  Attempt {attempt + 1}/{max_retries} failed: {e}[/yellow]")
+                    console.print(f"[dim]   Retrying in {retry_delay} seconds...[/dim]")
+                    time.sleep(retry_delay)
+                else:
+                    console.print(f"[red]❌ Failed to connect to Kafka after {max_retries} attempts: {e}[/red]")
+                    console.print(f"[yellow]💡 Đảm bảo Kafka đang chạy: docker-compose up -d trong thư mục kafka[/yellow]")
+                    raise
     return producer
 
 
@@ -111,61 +154,49 @@ def add_video():
         
         # Send to Kafka
         kafka_producer = get_kafka_producer()
-        future = kafka_producer.send(
-            KAFKA_TOPIC,
-            value=message,
-            key=request_id  # Use request_id as key for partitioning
-        )
         
-        # Gửi message (fire and forget với acks=0)
-        # Với acks=0, producer không đợi confirmation nên không có timeout
         try:
-            # Gửi message (không đợi response)
-            console.print(f"[cyan]📤 Sending video to Kafka: {video_url[:60]}... (request_id: {request_id})[/cyan]")
+            console.print(f"[cyan]📤 Sending video to Kafka: {video_url[:60]}...[/cyan]")
+            console.print(f"[dim]Request ID: {request_id}[/dim]")
             
-            # Với acks=0, future.get() sẽ return ngay lập tức
-            # Nhưng vẫn cần gọi để đảm bảo message được gửi vào buffer
-            try:
-                record_metadata = future.get(timeout=2)  # Timeout ngắn
-                console.print(f"[green]✅ Video sent successfully (Partition: {record_metadata.partition}, Offset: {record_metadata.offset})[/green]")
-                
-                return jsonify({
-                    "status": "success",
-                    "message": "Video đã được gửi vào Kafka để xử lý",
-                    "request_id": request_id,
-                    "video_url": video_url,
-                    "timestamp": timestamp,
-                    "kafka_topic": KAFKA_TOPIC,
-                    "kafka_partition": record_metadata.partition,
-                    "kafka_offset": record_metadata.offset
-                }), 200
-            except Exception as e:
-                # Với acks=0, có thể không có metadata nhưng message vẫn được gửi
-                error_type = type(e).__name__
-                if "Timeout" in error_type or "NodeNotReady" in error_type:
-                    console.print(f"[yellow]⚠️  Kafka may not be ready, but message queued for sending[/yellow]")
-                    # Vẫn trả về success vì message đã được queue
-                    return jsonify({
-                        "status": "success",
-                        "message": "Video đã được queue để gửi vào Kafka",
-                        "request_id": request_id,
-                        "video_url": video_url,
-                        "timestamp": timestamp,
-                        "kafka_topic": KAFKA_TOPIC,
-                        "warning": "Kafka may not be fully ready, but message is queued"
-                    }), 200
-                else:
-                    raise
+            # Gửi message và đợi confirmation
+            future = kafka_producer.send(
+                KAFKA_TOPIC,
+                value=message,
+                key=request_id  # Use request_id as key for partitioning
+            )
+            
+            # Đợi confirmation từ Kafka (với timeout)
+            record_metadata = future.get(timeout=10)  # Đợi tối đa 10 giây
+            
+            # Flush để đảm bảo message được gửi ngay
+            kafka_producer.flush(timeout=5)
+            
+            console.print(f"[green]✅ Video sent to Kafka successfully![/green]")
+            console.print(f"[dim]   Topic: {record_metadata.topic}[/dim]")
+            console.print(f"[dim]   Partition: {record_metadata.partition}[/dim]")
+            console.print(f"[dim]   Offset: {record_metadata.offset}[/dim]")
+            
+            return jsonify({
+                "status": "success",
+                "message": "Video đã được gửi vào Kafka để xử lý",
+                "request_id": request_id,
+                "video_url": video_url,
+                "timestamp": timestamp,
+                "kafka_topic": record_metadata.topic,
+                "kafka_partition": record_metadata.partition,
+                "kafka_offset": record_metadata.offset
+            }), 200
             
         except Exception as e:
             console.print(f"[red]❌ Failed to send to Kafka: {e}[/red]")
+            import traceback
+            traceback.print_exc()
             error_msg = str(e)
-            if "timeout" in error_msg.lower() or "metadata" in error_msg.lower() or "NodeNotReady" in error_msg:
-                error_msg += ". Đảm bảo Kafka đang chạy và sẵn sàng: docker-compose up -d trong thư mục kafka"
             return jsonify({
                 "status": "error",
                 "message": f"Lỗi khi gửi vào Kafka: {error_msg}",
-                "hint": "Kiểm tra Kafka: docker ps | findstr kafka và đợi vài giây để Kafka khởi động hoàn toàn"
+                "hint": "Kiểm tra Kafka đang chạy: docker ps | findstr kafka"
             }), 500
             
     except Exception as e:
@@ -180,15 +211,16 @@ def add_video():
 def health_check():
     """Health check endpoint"""
     try:
-        # Test Kafka connection với timeout ngắn
+        # Test Kafka connection với timeout dài hơn
         from kafka import KafkaProducer
         test_producer = KafkaProducer(
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            request_timeout_ms=5000,  # 5 seconds timeout
+            request_timeout_ms=10000,  # 10 seconds timeout
+            max_block_ms=10000,
             api_version=(0, 10, 1)
         )
         # Test bằng cách list topics (nhanh hơn)
-        test_producer.close(timeout=1)
+        test_producer.close(timeout=2)
         return jsonify({
             "status": "healthy",
             "kafka": "connected",

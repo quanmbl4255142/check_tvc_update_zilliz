@@ -70,23 +70,45 @@ def connect_redis() -> redis.Redis:
 def connect_kafka() -> KafkaConsumer:
     """Kết nối Kafka Consumer"""
     try:
-        # Dùng group_id mới để đảm bảo đọc được messages
-        import time
-        unique_group_id = f"{KAFKA_GROUP_ID}_{int(time.time())}"
-        
+        # Dùng group_id cố định để đảm bảo đọc được messages mới
+        # Nếu muốn đọc lại từ đầu, có thể reset offset: kafka-consumer-groups --reset-offsets
         consumer = KafkaConsumer(
-            KAFKA_TOPIC,
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            group_id=unique_group_id,  # Group ID unique để đọc tất cả messages
+            group_id=KAFKA_GROUP_ID,  # Group ID cố định
             value_deserializer=lambda m: json.loads(m.decode('utf-8')),
             key_deserializer=lambda k: k.decode('utf-8') if k else None,
-            auto_offset_reset='earliest',  # Đọc từ đầu
-            enable_auto_commit=True,
-            auto_commit_interval_ms=1000,
-            consumer_timeout_ms=1000
+            auto_offset_reset='latest',  # Đọc từ message mới nhất (không đọc lại messages cũ)
+            enable_auto_commit=True,  # Auto commit để đảm bảo không đọc lại
+            consumer_timeout_ms=2000,
+            api_version=(0, 10, 1)  # Chỉ định API version để nhất quán với producer
         )
+        
+        # Subscribe topic
+        consumer.subscribe([KAFKA_TOPIC])
+        console.print(f"[yellow]Subscribing to topic: {KAFKA_TOPIC}...[/yellow]")
+        
+        # Đợi assignment (topic có thể chưa tồn tại, sẽ được tạo khi có message đầu tiên)
+        import time as time_module
+        console.print(f"[dim]Waiting for partition assignment (topic may be auto-created on first message)...[/dim]")
+        timeout = time_module.time() + 10
+        assignment_received = False
+        poll_attempts = 0
+        while time_module.time() < timeout and poll_attempts < 50:
+            consumer.poll(timeout_ms=200)
+            poll_attempts += 1
+            if consumer.assignment():
+                assignment_received = True
+                break
+        
+        if assignment_received:
+            partitions = [p.partition for p in consumer.assignment()]
+            console.print(f"[green]✅ Assigned to partitions: {partitions}[/green]")
+        else:
+            console.print(f"[yellow]⚠️  No partitions assigned yet (topic may not exist, will wait for messages)[/yellow]")
+        
         console.print(f"[green]✅ Kafka consumer connected: {KAFKA_BOOTSTRAP_SERVERS}[/green]")
-        console.print(f"[cyan]📨 Topic: {KAFKA_TOPIC}, Group: {unique_group_id}[/cyan]")
+        console.print(f"[cyan]📨 Topic: {KAFKA_TOPIC}, Group: {KAFKA_GROUP_ID}[/cyan]")
+        console.print(f"[dim]   Auto offset reset: latest (will read new messages only)[/dim]")
         return consumer
     except Exception as e:
         console.print(f"[red]❌ Failed to connect to Kafka: {e}[/red]")
@@ -307,6 +329,7 @@ def main():
         sys.exit(1)
     
     console.print("\n[green]✅ All services connected! Waiting for messages...[/green]\n")
+    console.print(f"[dim]Consumer will read from earliest offset (all messages)[/dim]\n")
     
     # Consumer loop
     try:
@@ -314,21 +337,27 @@ def main():
         poll_count = 0
         while True:
             try:
-                # Poll for messages (timeout 1 second)
-                message_pack = kafka_consumer.poll(timeout_ms=1000)
+                # Poll for messages (timeout 2 seconds)
+                message_pack = kafka_consumer.poll(timeout_ms=2000)
                 poll_count += 1
                 
                 if not message_pack:
+                    # Log mỗi 10 lần poll để biết đang hoạt động
+                    if poll_count % 10 == 0:
+                        console.print(f"[dim]Polling... (polled {poll_count} times, waiting for messages)[/dim]")
                     continue
                 
                 # Có messages!
                 total_messages = sum(len(msgs) for msgs in message_pack.values())
-                console.print(f"\n[green]📨 Received {total_messages} message(s) from {len(message_pack)} partition(s)[/green]")
+                console.print(f"\n[bold green]📨 Received {total_messages} message(s) from {len(message_pack)} partition(s)[/bold green]")
                 
                 # Process each partition
                 for topic_partition, messages in message_pack.items():
+                    console.print(f"[cyan]Processing partition {topic_partition.partition}...[/cyan]")
                     for message in messages:
                         try:
+                            console.print(f"[yellow]Processing message: {message.value.get('request_id', 'unknown')[:8]}...[/yellow]")
+                            
                             # Process message
                             result = process_video_message(
                                 message.value,
@@ -336,6 +365,8 @@ def main():
                                 video_service
                             )
                             
+                            # Commit sau khi xử lý thành công
+                            kafka_consumer.commit()
                             processed_count += 1
                             
                             # Print result summary
