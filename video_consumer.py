@@ -23,7 +23,8 @@ from milvus_config import print_config
 console = Console()
 
 # Configuration
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+# Dùng 127.0.0.1 thay vì localhost để tránh vấn đề DNS resolution
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "video_processing")
 # Group ID cố định - nếu muốn reset offset, set RESET_OFFSET=true hoặc xóa consumer group
 KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "video_processor_group")
@@ -106,8 +107,7 @@ def connect_redis() -> redis.Redis:
                 socket_timeout=REDIS_SOCKET_TIMEOUT,
                 socket_keepalive=True,  # Keep connection alive
                 health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
-                retry_on_timeout=True,  # Retry on timeout
-                retry_on_error=[redis.ConnectionError, redis.TimeoutError]
+                # Removed deprecated retry_on_timeout and retry_on_error (included by default in redis-py 6.0+)
             )
             # Test connection
             r.ping()
@@ -156,24 +156,30 @@ def connect_kafka() -> KafkaConsumer:
         consumer.subscribe([KAFKA_TOPIC])
         console.print(f"[yellow]Subscribing to topic: {KAFKA_TOPIC}...[/yellow]")
         
-        # Đợi assignment (topic có thể chưa tồn tại, sẽ được tạo khi có message đầu tiên)
+        # Đợi assignment - tăng timeout và số lần poll
         import time as time_module
         console.print(f"[dim]Waiting for partition assignment (topic may be auto-created on first message)...[/dim]")
-        timeout = time_module.time() + 10
+        timeout = time_module.time() + 30  # Tăng từ 10s lên 30s
         assignment_received = False
         poll_attempts = 0
-        while time_module.time() < timeout and poll_attempts < 50:
+        max_poll_attempts = 150  # Tăng từ 50 lên 150 (30s / 0.2s = 150)
+        
+        while time_module.time() < timeout and poll_attempts < max_poll_attempts:
             consumer.poll(timeout_ms=200)
             poll_attempts += 1
             if consumer.assignment():
                 assignment_received = True
                 break
+            # Log mỗi 25 lần poll để biết đang đợi
+            if poll_attempts % 25 == 0:
+                console.print(f"[dim]   Still waiting for partition assignment... (polled {poll_attempts} times)[/dim]")
         
         if assignment_received:
             partitions = [p.partition for p in consumer.assignment()]
             console.print(f"[green]✅ Assigned to partitions: {partitions}[/green]")
         else:
-            console.print(f"[yellow]⚠️  No partitions assigned yet (topic may not exist, will wait for messages)[/yellow]")
+            console.print(f"[yellow]⚠️  No partitions assigned yet after {poll_attempts} polls (topic exists but assignment pending)[/yellow]")
+            console.print(f"[dim]   Consumer will continue polling and will be assigned when metadata syncs[/dim]")
         
         console.print(f"[green]✅ Kafka consumer connected: {KAFKA_BOOTSTRAP_SERVERS}[/green]")
         console.print(f"[cyan]📨 Topic: {KAFKA_TOPIC}, Group: {group_id}[/cyan]")
@@ -257,14 +263,20 @@ def process_video_message(
     """
     Xử lý một video message từ Kafka
     
-    Luồng:
-    1. Lưu initial status "processing" vào Redis (tránh race condition)
-    2. Kiểm tra Redis cache
-    3. Nếu cache miss → Embedding & Search Milvus
-    4. Nếu TVC mới → Lưu vào Milvus & Lấy unique_id mới
-    5. Nếu TVC cũ → Lấy unique_id cũ
-    6. Lưu vào Redis cache
-    7. Trả về kết quả
+    Luồng theo flowchart:
+    0. Lưu initial status "processing" vào Redis (tránh race condition)
+    1. Kiểm tra Redis cache
+       - Cache Hit → Bước 4: Lưu vào cache chờ xử lý
+       - Cache Miss → Bước 2: Embedding & Search Milvus
+    2. Embedding & Search Milvus
+       - TVC MỚI → Bước 3a: Lưu vào Root & Lấy unique_id MỚI
+       - TVC CŨ → Bước 3b: Lấy unique_id CŨ
+    3a/3b: Lấy unique_id (mới hoặc cũ)
+    4. Lưu vào Redis cache (processing cache)
+    5. Chuẩn bị Full Metadata Log
+    6a. Lưu vào Milvus Logs (Collection 2) - Optional
+    6b. Cập nhật Cache
+    7. Hoàn tất
     """
     request_id = message.get("request_id", "unknown")
     video_url = message.get("video_url", "")
@@ -340,9 +352,27 @@ def process_video_message(
             # Lấy stats hiện tại
             stats = get_stats_from_redis(redis_client)
             
+            # Bước 5: Chuẩn bị Full Metadata Log (cho cache hit)
+            console.print("[yellow]📋 Bước 5: Chuẩn bị Full Metadata Log (cache hit)...[/yellow]")
+            similarity = cached_info.get("similarity", 0.0)
+            full_metadata_log = {
+                "request_id": request_id,
+                "video_url": video_url,
+                "unique_id": unique_id,
+                "is_new": is_new,
+                "similarity": float(similarity),
+                "added_at": added_at,
+                "processed_at": datetime.now().isoformat(),
+                "cache_hit": True,
+                "status": "completed"
+            }
+            console.print("[green]✅ Đã chuẩn bị Full Metadata Log[/green]")
+            
+            # Bước 6b: Cập nhật Cache (cho cache hit - không cần update stats vì không có thay đổi)
+            console.print("[yellow]🔄 Bước 6b: Cập nhật Cache (cache hit - no stats change)...[/yellow]")
+            
             # Lưu kết quả với request_id để API có thể query
             result_key = f"request_id:{request_id}"
-            similarity = cached_info.get("similarity", 0.0)
             result_data = {
                 "status": "completed",
                 "request_id": request_id,
@@ -352,13 +382,15 @@ def process_video_message(
                 "similarity": similarity,
                 "added_at": added_at,
                 "message": "Video đã được thêm mới vào Zilliz" if is_new else f"Video đã có trên dữ liệu (similarity: {similarity:.4f}) nên sẽ không thêm vào Zilliz",
-                "cache_hit": True
+                "cache_hit": True,
+                "full_metadata": full_metadata_log  # Include full metadata
             }
             redis_client.setex(
                 result_key,
                 RESULT_TTL,  # TTL 30 phút
                 json.dumps(result_data)
             )
+            console.print("[green]✅ Đã cập nhật Cache (Bước 6b)[/green]")
             
             return {
                 "status": "success",
@@ -429,8 +461,8 @@ def process_video_message(
         else:
             console.print(f"[yellow]⚠️  TVC CŨ - Đã tồn tại với unique_id: {unique_id} (similarity: {similarity:.4f})[/yellow]")
         
-        # Bước 4: Lưu vào Redis cache
-        console.print("[yellow]💾 Bước 4: Lưu vào Redis cache...[/yellow]")
+        # Bước 4: Lưu vào Redis cache (processing cache) - đã có unique_id
+        console.print("[yellow]💾 Bước 4: Lưu vào Redis cache (processing cache)...[/yellow]")
         cache_data = {
             "unique_id": unique_id,
             "is_new": is_new,
@@ -445,7 +477,42 @@ def process_video_message(
         )
         console.print("[green]✅ Đã lưu vào Redis cache[/green]")
         
-        # Lưu kết quả với request_id để API có thể query
+        # Bước 5: Chuẩn bị Full Metadata Log
+        console.print("[yellow]📋 Bước 5: Chuẩn bị Full Metadata Log...[/yellow]")
+        full_metadata_log = {
+            "request_id": request_id,
+            "video_url": video_url,
+            "unique_id": unique_id,
+            "is_new": is_new,
+            "similarity": float(similarity),
+            "added_at": timestamp,
+            "processed_at": datetime.now().isoformat(),
+            "stats_before": stats_before,
+            "stats_after": stats_after,
+            "cache_hit": False,
+            "status": "completed"
+        }
+        console.print("[green]✅ Đã chuẩn bị Full Metadata Log[/green]")
+        
+        # Bước 6a: Lưu vào Milvus Logs (Collection 2) - Optional
+        # Nếu có collection logs, có thể lưu vào đây để tracking/audit
+        # Hiện tại skip vì chưa có collection logs được định nghĩa
+        # TODO: Implement nếu cần collection logs riêng
+        # console.print("[yellow]📝 Bước 6a: Lưu vào Milvus Logs (Collection 2)...[/yellow]")
+        # ... save to logs collection if exists ...
+        
+        # Bước 6b: Cập nhật Cache (final cache update)
+        console.print("[yellow]🔄 Bước 6b: Cập nhật Cache...[/yellow]")
+        # Cập nhật stats
+        stats = {
+            "total_before": stats_before,
+            "total_after": stats_after,
+            "added": 1 if is_new else 0,
+            "duplicates": 0 if is_new else 1
+        }
+        update_stats_in_redis(redis_client, stats)
+        
+        # Lưu kết quả với request_id để API có thể query (sử dụng full_metadata_log)
         result_key = f"request_id:{request_id}"
         result_data = {
             "status": "completed",
@@ -457,7 +524,8 @@ def process_video_message(
             "added_at": timestamp,
             "message": "Video đã được thêm mới vào Zilliz" if is_new else f"Video đã có trên dữ liệu (similarity: {similarity:.4f}) nên sẽ không thêm vào Zilliz",
             "stats_before": stats_before,
-            "stats_after": stats_after
+            "stats_after": stats_after,
+            "full_metadata": full_metadata_log  # Include full metadata
         }
         redis_client.setex(
             result_key,
@@ -465,15 +533,7 @@ def process_video_message(
             json.dumps(result_data)
         )
         console.print(f"[green]✅ Đã lưu kết quả với request_id: {request_id}[/green]")
-        
-        # Cập nhật stats
-        stats = {
-            "total_before": stats_before,
-            "total_after": stats_after,
-            "added": 1 if is_new else 0,
-            "duplicates": 0 if is_new else 1
-        }
-        update_stats_in_redis(redis_client, stats)
+        console.print("[green]✅ Đã cập nhật Cache (Bước 6b)[/green]")
         
         # Lấy stats tổng hợp
         final_stats = get_stats_from_redis(redis_client)
@@ -562,7 +622,13 @@ def main():
                 if not message_pack:
                     # Log mỗi 10 lần poll để biết đang hoạt động
                     if poll_count % 10 == 0:
-                        console.print(f"[dim]Polling... (polled {poll_count} times, waiting for messages)[/dim]")
+                        # Kiểm tra assignment để đảm bảo consumer đã được assign partition
+                        assignment = kafka_consumer.assignment()
+                        if assignment:
+                            partitions = [p.partition for p in assignment]
+                            console.print(f"[dim]Polling... (polled {poll_count} times, assigned to partitions: {partitions}, waiting for messages)[/dim]")
+                        else:
+                            console.print(f"[yellow]⚠️  Polling... (polled {poll_count} times, NO PARTITION ASSIGNED YET - topic may not exist)[/yellow]")
                     continue
                 
                 # Có messages!
@@ -570,6 +636,10 @@ def main():
                 console.print(f"\n[bold green]📨 Received {total_messages} message(s) from {len(message_pack)} partition(s)[/bold green]")
                 
                 # Process each partition
+                # Track messages để commit sau khi xử lý xong tất cả
+                messages_to_commit = []
+                messages_processed = 0
+                
                 for topic_partition, messages in message_pack.items():
                     console.print(f"[cyan]Processing partition {topic_partition.partition}...[/cyan]")
                     for message in messages:
@@ -583,8 +653,8 @@ def main():
                         try:
                             if redis_client.get(idempotency_key):
                                 console.print(f"[yellow]⚠️  Message đã được xử lý trước đó (idempotency check): {request_id}[/yellow]")
-                                # Commit ngay vì đã xử lý rồi
-                                kafka_consumer.commit()
+                                # Đánh dấu message này đã được xử lý, sẽ commit sau
+                                messages_to_commit.append((topic_partition, message_offset))
                                 continue
                         except Exception as idem_error:
                             console.print(f"[yellow]⚠️  Idempotency check failed: {idem_error}[/yellow]")
@@ -621,9 +691,11 @@ def main():
                                 except Exception:
                                     pass  # Ignore idempotency save error
                                 
-                                kafka_consumer.commit()
+                                # Đánh dấu message này đã xử lý xong, sẽ commit sau
+                                messages_to_commit.append((topic_partition, message_offset))
                                 processed_count += 1
-                                console.print(f"[green]✅ Committed offset for request_id: {request_id}[/green]")
+                                messages_processed += 1
+                                console.print(f"[green]✅ Message processed successfully: {request_id}[/green]")
                             else:
                                 console.print(f"[yellow]⚠️  Không commit offset vì status không rõ ràng: {result.get('status')}[/yellow]")
                             
@@ -685,6 +757,15 @@ def main():
                             time.sleep(RETRY_DELAY_SECONDS)
                             
                             continue
+                
+                # Commit tất cả messages đã xử lý thành công (chỉ commit 1 lần)
+                if messages_to_commit:
+                    try:
+                        kafka_consumer.commit()
+                        console.print(f"[green]✅ Committed {len(messages_to_commit)} message(s) successfully[/green]")
+                    except Exception as commit_error:
+                        console.print(f"[yellow]⚠️  Commit error: {commit_error}[/yellow]")
+                        # Không raise exception vì messages đã được xử lý, chỉ commit failed
                 
             except KeyboardInterrupt:
                 console.print("\n[yellow]⚠️  Interrupted by user[/yellow]")

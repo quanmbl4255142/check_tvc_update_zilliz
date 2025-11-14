@@ -45,11 +45,11 @@ def submit_video():
             }), 400
         
         # Forward request to video API
-        # Tăng timeout lên 60s để đảm bảo có đủ thời gian cho Kafka metadata fetch
+        # Timeout 15s - đủ cho gửi message (đã đơn giản hóa, không cần timeout dài)
         response = requests.post(
             API_VIDEO_ENDPOINT,
             json={"video_url": video_url},
-            timeout=60  # Tăng từ 15s lên 60s để đảm bảo có đủ thời gian
+            timeout=15  # Đơn giản hóa: timeout ngắn, nếu lỗi sẽ retry
         )
         
         if response.status_code == 200:

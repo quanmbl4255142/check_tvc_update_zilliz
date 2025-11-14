@@ -22,13 +22,13 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      # Hỗ trợ cả internal (kafka:9092) và external (localhost:9092)
-      # PLAINTEXT: cho internal communication giữa các containers
-      # PLAINTEXT_HOST: cho external communication từ host machine
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Hỗ trợ cả internal (container-to-container) và external (host machine)
+      # INTERNAL: cho Kafka UI và các container khác (kafka:9092)
+      # EXTERNAL: cho Python client chạy trên host machine (127.0.0.1:9092)
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092,INTERNAL://kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       # Cải thiện network handling
       KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
       KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 102400
@@ -56,7 +56,7 @@ services:
       - kafka
     environment:
       - KAFKA_CLUSTERS_0_NAME=Local-Kafka
-      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9093
       - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
       - DYNAMIC_CONFIG_ENABLED=true
       - LOGGING_LEVEL_COM_PROVECTUS=WARN
