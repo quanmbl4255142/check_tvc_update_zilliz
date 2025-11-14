@@ -3,6 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>Video Processing - Kafka + Redis + Milvus</title>
     <style>
         * {
@@ -410,15 +413,29 @@
 
                 const data = await response.json();
 
-                loading.classList.remove('show');
-                submitBtn.disabled = false;
-
-                if (data.status === 'success') {
+                if (response.status === 202 || data.status === 'processing') {
+                    // Đang xử lý - poll status endpoint
+                    const requestId = data.request_id;
+                    if (requestId) {
+                        pollVideoStatus(requestId, videoUrl);
+                    } else {
+                        loading.classList.remove('show');
+                        submitBtn.disabled = false;
+                        showResult({
+                            status: 'error',
+                            message: 'Không nhận được request_id'
+                        }, 'error');
+                    }
+                } else if (data.status === 'success') {
+                    // Có kết quả ngay (cache hit)
+                    loading.classList.remove('show');
+                    submitBtn.disabled = false;
                     showResult(data, 'success');
                     addToHistory(videoUrl, data);
-                    // Wait a bit then refresh stats (consumer needs time to process)
                     setTimeout(loadStats, 2000);
                 } else {
+                    loading.classList.remove('show');
+                    submitBtn.disabled = false;
                     showResult(data, 'error');
                 }
             } catch (error) {
@@ -503,6 +520,104 @@
             }
 
             renderHistory();
+        }
+
+        async function pollVideoStatus(requestId, videoUrl) {
+            const maxAttempts = 120; // Tăng lên 120 lần (khoảng 15-20 phút với exponential backoff)
+            let attempts = 0;
+            let currentInterval = 2000; // Bắt đầu với 2 giây (nhanh hơn cho lần đầu)
+            let pollTimeout = null;
+            const maxInterval = 15000; // Max 15 giây giữa các lần poll
+            const minInterval = 2000; // Min 2 giây
+            
+            // Hiển thị thông tin polling
+            const loading = document.getElementById('loading');
+            const loadingText = loading.querySelector('p');
+            if (loadingText) {
+                loadingText.textContent = `Đang xử lý... (${attempts}/${maxAttempts})`;
+            }
+            
+            const poll = async () => {
+                attempts++;
+                
+                // Update loading text
+                if (loadingText) {
+                    loadingText.textContent = `Đang xử lý... (${attempts}/${maxAttempts}) - Đảm bảo video_consumer.py đang chạy!`;
+                }
+                
+                try {
+                    const response = await fetch(`/api/video/status/${requestId}?_t=${Date.now()}`); // Cache busting
+                    const data = await response.json();
+                    
+                    if (data.status === 'completed' || data.status === 'success') {
+                        // Có kết quả - dừng polling
+                        if (pollTimeout) clearTimeout(pollTimeout);
+                        loading.classList.remove('show');
+                        const submitBtn = document.getElementById('submitBtn');
+                        submitBtn.disabled = false;
+                        
+                        showResult(data, 'success');
+                        addToHistory(videoUrl, data);
+                        setTimeout(loadStats, 2000);
+                        return; // Dừng polling
+                    } else if (data.status === 'error') {
+                        // Có lỗi - dừng polling
+                        if (pollTimeout) clearTimeout(pollTimeout);
+                        loading.classList.remove('show');
+                        const submitBtn = document.getElementById('submitBtn');
+                        submitBtn.disabled = false;
+                        
+                        showResult(data, 'error');
+                        return; // Dừng polling
+                    } else if (attempts >= maxAttempts) {
+                        // Timeout sau 10-15 phút
+                        if (pollTimeout) clearTimeout(pollTimeout);
+                        loading.classList.remove('show');
+                        const submitBtn = document.getElementById('submitBtn');
+                        submitBtn.disabled = false;
+                        
+                        showResult({
+                            status: 'error',
+                            message: 'Timeout: Không nhận được kết quả sau 10-15 phút. Video có thể đang được xử lý hoặc video_consumer.py chưa chạy. Vui lòng kiểm tra consumer và thử lại sau.'
+                        }, 'error');
+                        return; // Dừng polling
+                    }
+                    
+                    // Tiếp tục poll với exponential backoff (tăng dần interval)
+                    // Interval: 2s -> 2.5s -> 3s -> ... -> 15s (max 15s)
+                    // Exponential: interval = minInterval * (1.1 ^ attempts) capped at maxInterval
+                    currentInterval = Math.min(
+                        Math.max(minInterval * Math.pow(1.1, attempts), minInterval),
+                        maxInterval
+                    );
+                    pollTimeout = setTimeout(poll, currentInterval);
+                    
+                } catch (error) {
+                    console.error('Error polling status:', error);
+                    if (attempts >= maxAttempts) {
+                        if (pollTimeout) clearTimeout(pollTimeout);
+                        loading.classList.remove('show');
+                        const submitBtn = document.getElementById('submitBtn');
+                        submitBtn.disabled = false;
+                        
+                        showResult({
+                            status: 'error',
+                            message: 'Lỗi khi kiểm tra trạng thái: ' + error.message + '. Đảm bảo video_consumer.py đang chạy!'
+                        }, 'error');
+                        return; // Dừng polling
+                    }
+                    
+                    // Tiếp tục poll với exponential backoff
+                    currentInterval = Math.min(
+                        Math.max(minInterval * Math.pow(1.1, attempts), minInterval),
+                        maxInterval
+                    );
+                    pollTimeout = setTimeout(poll, currentInterval);
+                }
+            };
+            
+            // Bắt đầu poll lần đầu sau 2 giây (nhanh hơn để phản hồi nhanh)
+            pollTimeout = setTimeout(poll, minInterval);
         }
 
         function renderHistory() {

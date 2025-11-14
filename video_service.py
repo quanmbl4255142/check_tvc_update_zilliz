@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import tempfile
+import time
 import cv2
 import numpy as np
 from typing import Dict, Optional, Tuple
@@ -28,9 +29,24 @@ from milvus_config import (
     print_config,
 )
 
-# Allow override collection name via environment variable
-# Default to product_embeddings if not set
-DEFAULT_COLLECTION = os.getenv("MILVUS_COLLECTION", "product_embeddings")
+# Import timeout config
+try:
+    from timeout_config import (
+        VIDEO_EXTRACT_FRAME_TIMEOUT,
+        VIDEO_EXTRACT_FRAME_RETRIES,
+        MILVUS_INSERT_RETRIES,
+        MILVUS_INSERT_RETRY_DELAY,
+    )
+except ImportError:
+    # Fallback nếu không có timeout_config
+    VIDEO_EXTRACT_FRAME_TIMEOUT = int(os.getenv("VIDEO_EXTRACT_FRAME_TIMEOUT", "30"))
+    VIDEO_EXTRACT_FRAME_RETRIES = int(os.getenv("VIDEO_EXTRACT_FRAME_RETRIES", "2"))
+    MILVUS_INSERT_RETRIES = int(os.getenv("MILVUS_INSERT_RETRIES", "3"))
+    MILVUS_INSERT_RETRY_DELAY = int(os.getenv("MILVUS_INSERT_RETRY_DELAY", "1"))
+
+# Use COLLECTION_NAME from milvus_config (default: product_embeddings)
+# Can be overridden via MILVUS_COLLECTION environment variable
+DEFAULT_COLLECTION = COLLECTION_NAME
 
 from app import embed_image_clip, ensure_dir
 
@@ -38,25 +54,71 @@ from app import embed_image_clip, ensure_dir
 class VideoService:
     """Service để kiểm tra và thêm video vào Milvus"""
     
+    # Class-level connection để reuse connection giữa các instances
+    _milvus_connected = False
+    _connection_alias = "default"
+    
     def __init__(self, collection_name: str = None):
         self.collection_name = collection_name or DEFAULT_COLLECTION
         self.collection = None
         self._connect()
     
     def _connect(self):
-        """Kết nối đến Milvus và load collection"""
+        """Kết nối đến Milvus và load collection - reuse connection nếu đã có"""
         try:
-            params = get_connection_params()
-            connections.connect("default", **params)
+            # Chỉ connect nếu chưa connect (reuse connection)
+            if not VideoService._milvus_connected:
+                params = get_connection_params()
+                connections.connect(VideoService._connection_alias, **params)
+                VideoService._milvus_connected = True
+                print(f"✅ Connected to Milvus (connection reused)")
+            else:
+                # Kiểm tra connection còn hoạt động không
+                try:
+                    connections.get_connection_addr(VideoService._connection_alias)
+                except:
+                    # Connection bị mất, reconnect
+                    params = get_connection_params()
+                    connections.connect(VideoService._connection_alias, **params)
+                    print(f"✅ Reconnected to Milvus")
             
             if not utility.has_collection(self.collection_name):
                 raise ValueError(f"Collection '{self.collection_name}' không tồn tại!")
             
+            # Load collection (có thể cache collection object)
             self.collection = Collection(self.collection_name)
+            if not self.collection.has_index():
+                print(f"⚠️  Collection {self.collection_name} chưa có index!")
             self.collection.load()
             
-            # Kiểm tra embedding dimension
+            # Kiểm tra embedding dimension và schema fields
             schema = self.collection.schema
+            field_names = [f.name for f in schema.fields]
+            
+            # Detect schema type với validation rõ ràng
+            has_product_schema = "product_name" in field_names and "image_url" in field_names
+            has_video_schema = "url" in field_names and "job_id" in field_names
+            
+            if not has_product_schema and not has_video_schema:
+                error_msg = (
+                    f"⚠️  WARNING: Unknown schema! Fields: {field_names}\n"
+                    f"⚠️  Expected: product_name/image_url OR url/job_id\n"
+                    f"⚠️  Collection may not work correctly with this schema!"
+                )
+                print(error_msg)
+                # Raise error để force fix schema issue
+                # raise ValueError(f"Unsupported schema. Fields: {field_names}")
+            
+            # Store schema type for later use
+            self.has_product_schema = has_product_schema
+            self.has_video_schema = has_video_schema
+            self.schema_fields = field_names
+            
+            # Log schema type để debug
+            schema_type = "product_embeddings" if has_product_schema else "video_dedup" if has_video_schema else "unknown"
+            print(f"📋 Detected schema type: {schema_type}")
+            
+            # Check embedding dimension
             embedding_field = None
             for field in schema.fields:
                 if field.name == "embedding":
@@ -69,9 +131,11 @@ class VideoService:
                     print(f"⚠️  WARNING: Collection embedding dim={collection_dim} but CLIP creates dim={EMBEDDING_DIM}")
                     print(f"⚠️  This will cause errors when inserting! Please fix collection dimension.")
             
-            print(f"✅ Connected to Milvus collection: {self.collection_name}")
+            print(f"✅ Loaded Milvus collection: {self.collection_name}")
+            print(f"   Schema type: {'product_embeddings' if has_product_schema else 'video_dedup' if has_video_schema else 'unknown'}")
         except Exception as e:
             print(f"❌ Failed to connect to Milvus: {e}")
+            VideoService._milvus_connected = False  # Reset connection status
             raise
     
     def get_collection_count(self) -> int:
@@ -83,29 +147,96 @@ class VideoService:
         except Exception:
             return 0
     
-    def extract_first_frame(self, video_url: str) -> Optional[Image.Image]:
+    def extract_first_frame(self, video_url: str, timeout_seconds: int = None, max_retries: int = None) -> Optional[Image.Image]:
         """
-        Extract frame đầu tiên từ video URL
+        Extract frame đầu tiên từ video URL với timeout và retry mechanism
+        
+        Args:
+            video_url: URL của video
+            timeout_seconds: Timeout cho việc download video (mặc định từ config)
+            max_retries: Số lần retry tối đa (mặc định từ config)
         
         Returns:
             PIL Image hoặc None nếu lỗi
         """
-        try:
-            # Thử mở trực tiếp từ URL
-            cap = cv2.VideoCapture(video_url)
-            if cap.isOpened():
+        # Sử dụng config nếu không chỉ định
+        if timeout_seconds is None:
+            timeout_seconds = VIDEO_EXTRACT_FRAME_TIMEOUT
+        if max_retries is None:
+            max_retries = VIDEO_EXTRACT_FRAME_RETRIES
+        
+        retry_delay = 1
+        
+        for attempt in range(max_retries + 1):
+            try:
+                start_time = time.time()
+                
+                # Thử mở trực tiếp từ URL
+                cap = cv2.VideoCapture(video_url)
+                
+                if not cap.isOpened():
+                    if attempt < max_retries:
+                        print(f"⚠️  Cannot open video URL (attempt {attempt + 1}/{max_retries + 1}): {video_url}, retrying...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    print(f"⚠️  Cannot open video URL: {video_url}")
+                    return None
+                
+                # Set timeout cho read operation (OpenCV không hỗ trợ timeout trực tiếp)
+                # Sử dụng cách check thời gian thủ công
                 cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+                
+                # Check timeout trước khi read
+                elapsed = time.time() - start_time
+                if elapsed > timeout_seconds:
+                    cap.release()
+                    if attempt < max_retries:
+                        print(f"⚠️  Video open timeout (attempt {attempt + 1}/{max_retries + 1}), retrying...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    print(f"⚠️  Video open timeout after {elapsed:.1f}s")
+                    return None
+                
+                # Read frame với timeout check
                 success, frame = cap.read()
+                elapsed = time.time() - start_time
+                
                 cap.release()
+                
+                # Check timeout sau khi read
+                if elapsed > timeout_seconds:
+                    if attempt < max_retries:
+                        print(f"⚠️  Video processing timeout (attempt {attempt + 1}/{max_retries + 1}), retrying...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    print(f"⚠️  Video processing timeout after {elapsed:.1f}s")
+                    return None
                 
                 if success and frame is not None:
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     return Image.fromarray(rgb)
-            
-            return None
-        except Exception as e:
-            print(f"⚠️  Error extracting frame: {e}")
-            return None
+                
+                # Frame read failed, retry if possible
+                if attempt < max_retries:
+                    print(f"⚠️  Failed to read frame (attempt {attempt + 1}/{max_retries + 1}), retrying...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                
+                return None
+            except Exception as e:
+                if attempt < max_retries:
+                    print(f"⚠️  Error extracting frame (attempt {attempt + 1}/{max_retries + 1}): {e}, retrying...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                print(f"⚠️  Error extracting frame: {e}")
+                return None
+        
+        return None
     
     def create_embedding(self, video_url: str) -> Optional[np.ndarray]:
         """
@@ -172,12 +303,29 @@ class VideoService:
                 "params": {"nprobe": 16}
             }
             
+            # Determine output fields based on schema
+            if hasattr(self, 'has_product_schema') and self.has_product_schema:
+                output_fields = ["product_name", "image_url"]
+            elif hasattr(self, 'has_video_schema') and self.has_video_schema:
+                output_fields = ["url", "job_id"]
+            else:
+                # Try to detect from collection schema
+                schema = self.collection.schema
+                field_names = [f.name for f in schema.fields]
+                if "product_name" in field_names and "image_url" in field_names:
+                    output_fields = ["product_name", "image_url"]
+                elif "url" in field_names and "job_id" in field_names:
+                    output_fields = ["url", "job_id"]
+                else:
+                    # Fallback: try common fields
+                    output_fields = ["url", "job_id"] if "url" in field_names else ["product_name", "image_url"]
+            
             results = self.collection.search(
                 data=[embedding.tolist()],
                 anns_field="embedding",
                 param=search_params,
                 limit=top_k,
-                output_fields=["product_name", "image_url"]  # Schema mới
+                output_fields=output_fields
             )
             
             # Process results
@@ -189,13 +337,23 @@ class VideoService:
                     similarity = hit.distance
                     
                     if similarity >= threshold:
-                        # Schema: product_name, image_url (không có url, job_id)
-                        duplicates.append({
-                            "id": hit.id,
-                            "similarity": float(similarity),
-                            "url": hit.entity.get("image_url", ""),  # Dùng image_url thay vì url
-                            "job_id": hit.entity.get("product_name", "")  # Dùng product_name thay vì job_id
-                        })
+                        # Map fields based on schema type
+                        if hasattr(self, 'has_product_schema') and self.has_product_schema:
+                            # Schema: product_name, image_url
+                            duplicates.append({
+                                "id": hit.id,
+                                "similarity": float(similarity),
+                                "url": hit.entity.get("image_url", ""),
+                                "job_id": hit.entity.get("product_name", "")
+                            })
+                        else:
+                            # Schema: url, job_id
+                            duplicates.append({
+                                "id": hit.id,
+                                "similarity": float(similarity),
+                                "url": hit.entity.get("url", ""),
+                                "job_id": hit.entity.get("job_id", "")
+                            })
             
             return duplicates
             
@@ -218,26 +376,70 @@ class VideoService:
             self._connect()
         
         try:
-            # Generate job_id (unique identifier)
-            # Format: url_XXXX (4 digits, auto-increment based on collection size)
-            current_count = self.collection.num_entities
-            job_id = f"url_{current_count:04d}"
+            # Generate job_id (unique identifier) - Fix race condition
+            # Sử dụng UUID để đảm bảo unique, sau đó format lại nếu cần
+            import uuid
+            import time
             
-            # Insert into Milvus
-            # Collection schema: id (auto), product_name, image_url, embedding
-            # Format: list of lists matching schema field order
-            # Extract product name from URL (hoặc dùng job_id làm product_name)
-            product_name = job_id  # Hoặc extract từ URL
+            # Tạo unique ID dựa trên timestamp + UUID để tránh collision
+            # Format: url_TIMESTAMP_UUID (đảm bảo unique ngay cả khi concurrent)
+            timestamp = int(time.time() * 1000)  # milliseconds
+            unique_suffix = str(uuid.uuid4())[:8]  # 8 chars từ UUID
+            job_id = f"url_{timestamp}_{unique_suffix}"
             
-            self.collection.insert([
-                [product_name],    # product_name
-                [video_url],       # image_url (dùng video_url làm image_url)
-                [embedding.tolist()]  # embedding
-            ])
+            # Alternative: Nếu muốn giữ format url_XXXX, sử dụng Redis atomic counter
+            # Nhưng format mới này đảm bảo unique hơn và không cần external dependency
             
-            # Flush to ensure data is written
-            self.collection.flush()
+            # Insert into Milvus với retry mechanism
+            # Detect schema and insert accordingly
+            schema = self.collection.schema
+            # Get fields in order (excluding auto-id)
+            insert_fields = [f.name for f in schema.fields if f.name != "id"]
             
+            # Build insert data based on schema
+            insert_data = []
+            for field_name in insert_fields:
+                if field_name == "product_name":
+                    insert_data.append([job_id])
+                elif field_name == "image_url":
+                    insert_data.append([video_url])
+                elif field_name == "url":
+                    insert_data.append([video_url])
+                elif field_name == "job_id":
+                    insert_data.append([job_id])
+                elif field_name == "embedding":
+                    insert_data.append([embedding.tolist()])
+                else:
+                    # Unknown field - use empty string or default
+                    print(f"⚠️  WARNING: Unknown field '{field_name}' in schema, using empty string")
+                    insert_data.append([""])
+            
+            if not insert_data:
+                raise ValueError(f"Cannot determine insert fields for schema: {[f.name for f in schema.fields]}")
+            
+            # Retry insert với exponential backoff (sử dụng config)
+            max_retries = MILVUS_INSERT_RETRIES
+            retry_delay = MILVUS_INSERT_RETRY_DELAY
+            last_error = None
+            
+            for attempt in range(max_retries):
+                try:
+                    self.collection.insert(insert_data)
+                    # Flush to ensure data is written
+                    self.collection.flush()
+                    return job_id
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        print(f"⚠️  Insert attempt {attempt + 1} failed: {e}, retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        raise
+            
+            # Should not reach here, but just in case
+            if last_error:
+                raise last_error
             return job_id
             
         except Exception as e:

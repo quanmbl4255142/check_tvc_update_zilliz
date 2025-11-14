@@ -239,8 +239,8 @@ def main():
     )
     parser.add_argument(
         "--collection",
-        default="video_dedup",
-        help="Collection name (default: video_dedup)"
+        default="product_embeddings",
+        help="Collection name (default: product_embeddings)"
     )
     parser.add_argument(
         "--overwrite",

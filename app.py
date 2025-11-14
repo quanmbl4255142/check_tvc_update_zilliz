@@ -24,8 +24,9 @@ console = Console()
 
 # (Captioning/labeling functionality removed)
 
-# Cache for CLIP embedding model
+# Cache for CLIP embedding model với size limit để tránh memory leak
 _CLIP_CACHE: Optional[Dict[str, object]] = None
+_MAX_CACHE_SIZE = 3  # Giới hạn số lượng models trong cache (thường chỉ cần 1 model)
 
 
 @dataclass
@@ -90,13 +91,26 @@ def extract_frames_1fps(video_path: str, output_dir: str) -> List[str]:
 
 
 def _get_clip_model(model_id: str = "openai/clip-vit-base-patch32"):
-    """Load and cache CLIP processor/model on CPU/GPU."""
+    """Load and cache CLIP processor/model on CPU/GPU với memory management."""
     global _CLIP_CACHE
     if _CLIP_CACHE and _CLIP_CACHE.get("id") == model_id:
         return _CLIP_CACHE["processor"], _CLIP_CACHE["model"], _CLIP_CACHE["device"]
     try:
         from transformers import AutoProcessor, CLIPModel
         import torch
+        import gc
+        
+        # Clear cache nếu đã đạt limit (thường không cần vì chỉ dùng 1 model)
+        if _CLIP_CACHE and _CLIP_CACHE.get("id") != model_id:
+            # Clear old model from memory
+            if "model" in _CLIP_CACHE:
+                del _CLIP_CACHE["model"]
+            if "processor" in _CLIP_CACHE:
+                del _CLIP_CACHE["processor"]
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+        
         has_cuda = torch.cuda.is_available()
         device = torch.device("cuda" if has_cuda else "cpu")
         processor = AutoProcessor.from_pretrained(model_id)

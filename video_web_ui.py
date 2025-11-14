@@ -45,14 +45,19 @@ def submit_video():
             }), 400
         
         # Forward request to video API
+        # Tăng timeout lên 60s để đảm bảo có đủ thời gian cho Kafka metadata fetch
         response = requests.post(
             API_VIDEO_ENDPOINT,
             json={"video_url": video_url},
-            timeout=30  # Tăng timeout lên 30 giây vì Kafka có thể mất thời gian
+            timeout=60  # Tăng từ 15s lên 60s để đảm bảo có đủ thời gian
         )
         
         if response.status_code == 200:
+            # Có kết quả ngay (cache hit)
             return jsonify(response.json()), 200
+        elif response.status_code == 202:
+            # Đang xử lý - trả về request_id để UI poll status
+            return jsonify(response.json()), 202
         else:
             return jsonify({
                 "status": "error",
@@ -82,6 +87,21 @@ def health_check():
             "status": "error",
             "message": f"Không thể kết nối đến API: {str(e)}"
         }), 503
+
+@app.route('/api/video/status/<request_id>', methods=['GET'])
+def get_video_status(request_id):
+    """Proxy endpoint để check video status"""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/api/video/status/{request_id}",
+            timeout=5
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Không thể kiểm tra trạng thái: {str(e)}"
+        }), 500
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():

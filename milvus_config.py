@@ -57,7 +57,7 @@ else:
 # ============================================
 # COLLECTION SETTINGS
 # ============================================
-COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "video_dedup")
+COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "product_embeddings")
 
 # CLIP embedding dimension (openai/clip-vit-base-patch32)
 EMBEDDING_DIM = 512
