@@ -23,11 +23,12 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       # Hỗ trợ cả internal (container-to-container) và external (host machine)
-      # INTERNAL: cho Kafka UI và các container khác (kafka:9092)
+      # INTERNAL: cho Kafka UI và các container khác (kafka:9093)
       # EXTERNAL: cho Python client chạy trên host machine (127.0.0.1:9092)
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092,INTERNAL://kafka:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      # Lưu ý: Thứ tự quan trọng - INTERNAL phải đứng trước để được ưu tiên
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9093,EXTERNAL://127.0.0.1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       # Cải thiện network handling
       KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
@@ -47,26 +48,29 @@ services:
       - kafka_data:/var/lib/kafka/data
     networks:
       - kafka-network
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    container_name: kafka-ui
-    ports:
-      - "8080:8080"
-    depends_on:
-      - kafka
-    environment:
-      - KAFKA_CLUSTERS_0_NAME=Local-Kafka
-      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9093
-      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
-      - DYNAMIC_CONFIG_ENABLED=true
-      - LOGGING_LEVEL_COM_PROVECTUS=WARN
-      - KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL=PLAINTEXT
-      - KAFKA_CLUSTERS_0_PROPERTIES_METADATA_MAX_AGE_MS=300000
-      - KAFKA_CLUSTERS_0_PROPERTIES_REQUEST_TIMEOUT_MS=30000
-      - KAFKA_CLUSTERS_0_PROPERTIES_CONNECTIONS_MAX_IDLE_MS=600000
-    networks:
-      - kafka-network
-    restart: unless-stopped
+  # Kafka UI - Tạm thời comment để tránh warning logs
+  # Kafka UI có vấn đề với multiple listeners, không ảnh hưởng đến chức năng chính
+  # Để bật lại: uncomment và chạy docker-compose up -d kafka-ui
+  # kafka-ui:
+  #   image: provectuslabs/kafka-ui:latest
+  #   container_name: kafka-ui
+  #   ports:
+  #     - "8080:8080"
+  #   depends_on:
+  #     - kafka
+  #   environment:
+  #     - KAFKA_CLUSTERS_0_NAME=Local-Kafka
+  #     - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9093
+  #     - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+  #     - DYNAMIC_CONFIG_ENABLED=true
+  #     - LOGGING_LEVEL_COM_PROVECTUS=WARN
+  #     - KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL=PLAINTEXT
+  #     - KAFKA_CLUSTERS_0_PROPERTIES_METADATA_MAX_AGE_MS=300000
+  #     - KAFKA_CLUSTERS_0_PROPERTIES_REQUEST_TIMEOUT_MS=30000
+  #     - KAFKA_CLUSTERS_0_PROPERTIES_CONNECTIONS_MAX_IDLE_MS=600000
+  #   networks:
+  #     - kafka-network
+  #   restart: unless-stopped
 
   redis:
     image: redis:7-alpine

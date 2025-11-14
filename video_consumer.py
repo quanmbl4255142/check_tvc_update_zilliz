@@ -338,23 +338,79 @@ def process_video_message(
     cached_data = redis_client.get(cache_key)
     
     if cached_data:
-        # Cache Hit
+        # Cache Hit - Nhưng vẫn cần kiểm tra lại trong Milvus để phát hiện duplicate chính xác
+        # (Trường hợp: Video thứ 2 giống video thứ 1 nhưng cache đã có is_new=True)
         console.print("[green]✅ Cache Hit![/green]")
         try:
             cached_info = json.loads(cached_data)
-            unique_id = cached_info.get("unique_id")
-            is_new = cached_info.get("is_new", False)
+            cached_unique_id = cached_info.get("unique_id")
+            cached_is_new = cached_info.get("is_new", False)
             added_at = cached_info.get("added_at", timestamp)
             
-            console.print(f"[cyan]📋 Unique ID từ cache: {unique_id}[/cyan]")
-            console.print(f"[cyan]📊 Video {'MỚI' if is_new else 'CŨ'}: {video_url[:60]}...[/cyan]")
+            console.print(f"[cyan]📋 Unique ID từ cache: {cached_unique_id}[/cyan]")
+            console.print(f"[dim]   Cache is_new: {cached_is_new}[/dim]")
             
-            # Lấy stats hiện tại
+            # QUAN TRỌNG: Kiểm tra lại trong Milvus để đảm bảo phát hiện duplicate chính xác
+            # (Nếu video thứ 2 giống video thứ 1, Milvus sẽ phát hiện duplicate)
+            console.print("[yellow]🔍 Kiểm tra lại trong Milvus để phát hiện duplicate...[/yellow]")
+            
+            # Lấy số lượng videos hiện tại trong Milvus
+            stats_before = video_service.get_collection_count()
+            
+            # Kiểm tra duplicate trong Milvus
+            result = video_service.check_and_add_video(video_url)
+            
+            if result["status"] == "error":
+                # Nếu lỗi, dùng thông tin từ cache
+                console.print(f"[yellow]⚠️  Lỗi khi kiểm tra Milvus, dùng thông tin từ cache: {result.get('message')}[/yellow]")
+                is_new = cached_is_new
+                unique_id = cached_unique_id
+                similarity = cached_info.get("similarity", 0.0)
+            else:
+                # Dùng kết quả từ Milvus (chính xác hơn)
+                is_new = result["is_new"]
+                unique_id = result["unique_id"]
+                similarity = result.get("similarity", 0.0)
+                
+                # Nếu phát hiện duplicate (is_new=False), cập nhật cache với thông tin mới
+                if not is_new and cached_is_new:
+                    console.print(f"[yellow]⚠️  Phát hiện duplicate! Video đã tồn tại với unique_id: {unique_id} (similarity: {similarity:.4f})[/yellow]")
+                    # Cập nhật cache với thông tin duplicate
+                    updated_cache_data = {
+                        "unique_id": unique_id,
+                        "is_new": False,
+                        "similarity": similarity,
+                        "added_at": added_at,
+                        "cached_at": datetime.now().isoformat()
+                    }
+                    redis_client.setex(
+                        cache_key,
+                        CACHE_TTL,
+                        json.dumps(updated_cache_data)
+                    )
+                    console.print(f"[green]✅ Đã cập nhật cache với thông tin duplicate[/green]")
+            
+            # Lấy số lượng videos sau khi kiểm tra
+            stats_after = video_service.get_collection_count()
+            
+            console.print(f"[cyan]📊 Video {'MỚI' if is_new else 'CŨ (DUPLICATE)'}: {video_url[:60]}...[/cyan]")
+            if not is_new:
+                console.print(f"[yellow]   Similarity: {similarity:.4f}[/yellow]")
+            
+            # Cập nhật stats nếu phát hiện duplicate
             stats = get_stats_from_redis(redis_client)
+            if not is_new:
+                # Phát hiện duplicate - cập nhật stats
+                stats_to_update = {
+                    "duplicates": 1  # Tăng duplicate count
+                }
+                update_stats_in_redis(redis_client, stats_to_update)
+                console.print(f"[yellow]📊 Đã cập nhật stats: +1 duplicate[/yellow]")
+                # Lấy lại stats sau khi cập nhật
+                stats = get_stats_from_redis(redis_client)
             
-            # Bước 5: Chuẩn bị Full Metadata Log (cho cache hit)
-            console.print("[yellow]📋 Bước 5: Chuẩn bị Full Metadata Log (cache hit)...[/yellow]")
-            similarity = cached_info.get("similarity", 0.0)
+            # Bước 5: Chuẩn bị Full Metadata Log
+            console.print("[yellow]📋 Bước 5: Chuẩn bị Full Metadata Log...[/yellow]")
             full_metadata_log = {
                 "request_id": request_id,
                 "video_url": video_url,
@@ -364,12 +420,13 @@ def process_video_message(
                 "added_at": added_at,
                 "processed_at": datetime.now().isoformat(),
                 "cache_hit": True,
+                "milvus_checked": True,  # Đã kiểm tra lại trong Milvus
                 "status": "completed"
             }
             console.print("[green]✅ Đã chuẩn bị Full Metadata Log[/green]")
             
-            # Bước 6b: Cập nhật Cache (cho cache hit - không cần update stats vì không có thay đổi)
-            console.print("[yellow]🔄 Bước 6b: Cập nhật Cache (cache hit - no stats change)...[/yellow]")
+            # Bước 6b: Cập nhật Cache
+            console.print("[yellow]🔄 Bước 6b: Cập nhật Cache...[/yellow]")
             
             # Lưu kết quả với request_id để API có thể query
             result_key = f"request_id:{request_id}"
@@ -383,7 +440,8 @@ def process_video_message(
                 "added_at": added_at,
                 "message": "Video đã được thêm mới vào Zilliz" if is_new else f"Video đã có trên dữ liệu (similarity: {similarity:.4f}) nên sẽ không thêm vào Zilliz",
                 "cache_hit": True,
-                "full_metadata": full_metadata_log  # Include full metadata
+                "milvus_checked": True,  # Đã kiểm tra lại trong Milvus
+                "full_metadata": full_metadata_log
             }
             redis_client.setex(
                 result_key,
@@ -400,7 +458,8 @@ def process_video_message(
                 "unique_id": unique_id,
                 "is_new": is_new,
                 "added_at": added_at,
-                "message": "Video đã tồn tại trong cache",
+                "similarity": similarity,
+                "message": "Video đã được thêm mới vào Zilliz" if is_new else f"Video đã có trên dữ liệu (similarity: {similarity:.4f})",
                 "stats": stats
             }
         except Exception as e:
