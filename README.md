@@ -199,9 +199,10 @@ python filter_valid_urls.py --workers 20 --timeout 15
 
 **Chức năng:**
 - Kiểm tra status code của từng URL bằng HEAD request (nhanh hơn GET)
+- **Kiểm tra HLS manifest URLs**: Tự động phát hiện và kiểm tra HLS manifest URLs với FFmpeg
 - Xử lý đa luồng với thread pool (mặc định 10 workers)
-- Tách file: URLs hợp lệ (200) và URLs lỗi (403/404/timeout)
-- Báo cáo chi tiết: số lượng 403, 404, timeout, v.v.
+- Tách file: URLs hợp lệ (200) và URLs lỗi (403/404/HLS invalid/timeout)
+- Báo cáo chi tiết: số lượng 403, 404, HLS invalid, timeout, v.v.
 
 **Tham số:**
 - `--input`: File CSV input (default: `url-tvc.unique.csv`)
@@ -212,15 +213,18 @@ python filter_valid_urls.py --workers 20 --timeout 15
 - `--end`: Index kết thúc (default: all)
 - `--workers`: Số lượng workers đồng thời (default: 10)
 - `--timeout`: Timeout cho mỗi request (seconds, default: 10)
+- `--skip-hls-check`: Bỏ qua kiểm tra HLS manifest với FFmpeg (nhanh hơn nhưng có thể bỏ sót lỗi)
 
 **Output:**
-- `url-tvc.valid.csv`: URLs hợp lệ (status 200)
-- `url-tvc.invalid.csv`: URLs lỗi với thông tin status code và error
+- `url-tvc.valid.csv`: URLs hợp lệ (status 200, bao gồm cả HLS manifest hợp lệ)
+- `url-tvc.invalid.csv`: URLs lỗi với thông tin status code và error (bao gồm HLS invalid)
 
 **Lưu ý:** 
 - Bước này giúp tiết kiệm thời gian và tài nguyên khi upload lên Zilliz
 - Nên chạy bước này trước khi upload, đặc biệt với dataset lớn
 - Sử dụng file `url-tvc.valid.csv` làm input cho bước upload
+- **Cần cài FFmpeg** để kiểm tra HLS manifest URLs (nếu không có, script sẽ cảnh báo nhưng vẫn chạy)
+- Nếu không muốn kiểm tra HLS (nhanh hơn), dùng `--skip-hls-check`
 
 ---
 
@@ -393,24 +397,30 @@ python clean_empty_jobs.py --root batch_outputs
 
 ### 3. `filter_valid_urls.py`
 
-**Mục đích:** Lọc các URL hợp lệ, loại bỏ các URL bị 403/404 trước khi upload
+**Mục đích:** Lọc các URL hợp lệ, loại bỏ các URL bị 403/404 và HLS manifest không hợp lệ trước khi upload
 
 **Input:** `url-tvc.unique.csv` (hoặc file CSV chứa URLs)
 
 **Output:**
-- `url-tvc.valid.csv`: URLs hợp lệ (status 200)
-- `url-tvc.invalid.csv`: URLs lỗi với status code và error message
+- `url-tvc.valid.csv`: URLs hợp lệ (status 200, bao gồm cả HLS manifest hợp lệ)
+- `url-tvc.invalid.csv`: URLs lỗi với status code và error message (bao gồm HLS invalid)
 
 **Chức năng:**
 - Kiểm tra status code bằng HEAD request (nhanh hơn GET)
+- **Phát hiện và kiểm tra HLS manifest URLs**: Tự động nhận diện HLS manifest (`.m3u8`, `/manifest/hls`) và kiểm tra với FFmpeg
 - Xử lý đa luồng với thread pool
-- Phân loại: 200 (OK), 403 (Forbidden), 404 (Not Found), timeout, lỗi khác
+- Phân loại: 200 (OK), 403 (Forbidden), 404 (Not Found), HLS invalid, timeout, lỗi khác
 - Báo cáo chi tiết số lượng từng loại lỗi
 
 **Ưu điểm:**
-- Tiết kiệm thời gian: Loại bỏ các URL không hợp lệ trước khi upload
-- Tiết kiệm tài nguyên: Không cần xử lý các URL bị 403/404
+- Tiết kiệm thời gian: Loại bỏ các URL không hợp lệ trước khi upload (bao gồm cả HLS manifest không hợp lệ)
+- Tiết kiệm tài nguyên: Không cần xử lý các URL bị 403/404 hoặc HLS invalid
 - Xử lý nhanh: HEAD request + đa luồng
+- **Kiểm tra HLS**: Phát hiện sớm các HLS manifest URLs không thể xử lý được
+
+**Yêu cầu:**
+- FFmpeg (để kiểm tra HLS manifest URLs) - nếu không có, script vẫn chạy nhưng sẽ cảnh báo
+- Có thể bỏ qua kiểm tra HLS bằng `--skip-hls-check` để tăng tốc
 
 ---
 
@@ -605,12 +615,52 @@ python create_collection.py --collection video_dedup_v2 --schema video_dedup
 - Đảm bảo video URLs accessible
 - Xử lý theo chunks nhỏ hơn để tránh timeout
 
-### Nhiều URL bị 403/404
+### Nhiều URL bị 403/404 hoặc HLS manifest không hợp lệ
 
 **Giải pháp:**
 - Chạy `filter_valid_urls.py` để lọc các URL hợp lệ trước khi upload
+- Script sẽ tự động phát hiện và kiểm tra HLS manifest URLs với FFmpeg
 - Sử dụng file `url-tvc.valid.csv` làm input cho `direct_upload_to_zilliz.py`
-- Kiểm tra file `url-tvc.invalid.csv` để xem các URL bị lỗi
+- Kiểm tra file `url-tvc.invalid.csv` để xem các URL bị lỗi (bao gồm cả HLS invalid)
+- Nếu không có FFmpeg, cài đặt FFmpeg hoặc dùng `--skip-hls-check` để bỏ qua kiểm tra HLS
+
+### Lỗi: "exceeded the limit number of collections"
+
+**Nguyên nhân:** Zilliz Cloud plan của bạn đã đạt giới hạn số lượng collections (thường là 5 collections cho plan miễn phí/cơ bản).
+
+**Giải pháp:**
+
+1. **Xem collections hiện có:**
+```bash
+python list_collections.py
+```
+
+2. **Xóa collection không cần thiết:**
+```bash
+# Xóa với xác nhận
+python delete_collection.py --collection collection_name
+
+# Xóa không cần xác nhận (cẩn thận!)
+python delete_collection.py --collection collection_name --force
+```
+
+3. **Hoặc sử dụng collection đã có:**
+```bash
+# Kiểm tra collection có sẵn
+python list_collections.py
+
+# Sử dụng collection đã có thay vì tạo mới
+python direct_upload_to_zilliz.py --input url-tvc.valid.csv --collection existing_collection_name
+```
+
+4. **Nâng cấp plan Zilliz** (nếu cần nhiều collections hơn):
+- Đăng nhập vào Zilliz Cloud console
+- Nâng cấp plan để có nhiều collections hơn
+
+**Lưu ý:** 
+- ⚠️ Xóa collection sẽ xóa **TẤT CẢ** dữ liệu trong collection đó (không thể hoàn tác!)
+- Nên backup dữ liệu quan trọng trước khi xóa
+- Kiểm tra kỹ collection nào cần xóa bằng `list_collections.py`
 
 ---
 

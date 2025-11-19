@@ -20,6 +20,7 @@ from pymilvus import (
     utility,
 )
 
+# lấy dữ liệu để config từ milvus_config.py
 from milvus_config import (
     get_connection_params,
     COLLECTION_NAME,
