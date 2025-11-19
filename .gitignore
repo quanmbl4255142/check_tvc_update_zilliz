@@ -6,7 +6,7 @@ web_outputs/
 batch_outputs/
 *.mp4
 *.png
-*.csv
+
 *.webm
 *.mov
 *.mkv
