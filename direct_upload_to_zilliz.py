@@ -49,6 +49,79 @@ def safe_slug(text: str) -> str:
     return slug or "item"
 
 
+def is_hls_manifest(url: str) -> bool:
+    """Check if URL is an HLS manifest (.m3u8 or /manifest/hls)"""
+    url_lower = url.lower()
+    return (
+        '.m3u8' in url_lower or 
+        '/manifest/hls' in url_lower or
+        'hls_variant' in url_lower or
+        'hls' in url_lower and 'manifest' in url_lower
+    )
+
+
+def extract_frame_from_hls(url: str, output_path: str, timeout: int = 60) -> bool:
+    """
+    Extract first frame from HLS manifest using FFmpeg
+    
+    Args:
+        url: HLS manifest URL
+        output_path: Path to save the extracted frame image
+        timeout: Timeout in seconds
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        import subprocess
+        import shutil
+        
+        # Check if ffmpeg is available
+        if not shutil.which('ffmpeg'):
+            return False
+        
+        # Use FFmpeg to extract first frame from HLS stream
+        # -protocol_whitelist: allow https/http/file protocols (fixes "Protocol 'https' not on whitelist")
+        # -i: input URL
+        # -vframes 1: extract only 1 frame
+        # -ss 0: start at 0 seconds
+        # -y: overwrite output file
+        # -loglevel error: reduce output noise
+        cmd = [
+            'ffmpeg',
+            '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+            '-i', url,
+            '-vframes', '1',
+            '-ss', '0',
+            '-y',  # overwrite
+            '-loglevel', 'error',  # reduce noise
+            output_path
+        ]
+        
+        # Run FFmpeg with timeout
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout + 10,  # Add buffer
+            check=False
+        )
+        
+        # Check if output file was created and is valid
+        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return True
+        
+        return False
+        
+    except subprocess.TimeoutExpired:
+        return False
+    except FileNotFoundError:
+        # FFmpeg not found
+        return False
+    except Exception:
+        return False
+
+
 def read_urls_from_csv(csv_path: str, column: Optional[str]) -> List[str]:
     """Read URLs from CSV file"""
     urls: List[str] = []
@@ -194,6 +267,40 @@ def extract_first_frame_embedding(url: str, verbose: bool = False) -> tuple[Opti
         (embedding, error_message) - embedding is None if failed, error_message is None if success
     """
     error_messages = []
+    
+    # Check if URL is HLS manifest
+    if is_hls_manifest(url):
+        # HLS manifests need special handling
+        with tempfile.TemporaryDirectory() as tdir:
+            temp_img_path = os.path.join(tdir, "frame.png")
+            temp_npy_path = os.path.join(tdir, "embedding.npy")
+            
+            # Try FFmpeg to extract frame from HLS
+            if extract_frame_from_hls(url, temp_img_path, timeout=60):
+                try:
+                    # Verify image was created
+                    if os.path.exists(temp_img_path) and os.path.getsize(temp_img_path) > 0:
+                        # Create embedding
+                        embed_image_clip_to_npy(temp_img_path, temp_npy_path, model_id="openai/clip-vit-base-patch32")
+                        
+                        # Load and normalize
+                        vec = np.load(temp_npy_path).astype(np.float32).flatten()
+                        norm = np.linalg.norm(vec)
+                        if norm > 0:
+                            vec = vec / norm
+                            return (vec, None)
+                        else:
+                            error_messages.append("Embedding norm is zero (HLS)")
+                    else:
+                        error_messages.append("FFmpeg extracted empty frame from HLS")
+                except Exception as e:
+                    error_messages.append(f"Embedding creation failed from HLS: {str(e)}")
+            else:
+                error_messages.append("HLS manifest detected but FFmpeg extraction failed (FFmpeg may not be installed or URL is invalid)")
+            
+            # If FFmpeg failed, return early with clear error
+            final_error = "; ".join(error_messages) if error_messages else "HLS manifest not supported"
+            return (None, final_error)
     
     with tempfile.TemporaryDirectory() as tdir:
         # METHOD 1: Try opening directly from URL

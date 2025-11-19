@@ -51,6 +51,77 @@ DEFAULT_COLLECTION = COLLECTION_NAME
 from app import embed_image_clip, ensure_dir
 
 
+def is_hls_manifest(url: str) -> bool:
+    """Check if URL is an HLS manifest (.m3u8 or /manifest/hls)"""
+    url_lower = url.lower()
+    return (
+        '.m3u8' in url_lower or 
+        '/manifest/hls' in url_lower or
+        'hls_variant' in url_lower or
+        'hls' in url_lower and 'manifest' in url_lower
+    )
+
+
+def extract_frame_from_hls(url: str, output_path: str, timeout: int = 60) -> Optional[Image.Image]:
+    """
+    Extract first frame from HLS manifest using FFmpeg
+    
+    Args:
+        url: HLS manifest URL
+        output_path: Path to save the extracted frame image
+        timeout: Timeout in seconds
+    
+    Returns:
+        PIL Image if successful, None otherwise
+    """
+    try:
+        import subprocess
+        import shutil
+        
+        # Check if ffmpeg is available
+        if not shutil.which('ffmpeg'):
+            return None
+        
+        # Use FFmpeg to extract first frame from HLS stream
+        # -protocol_whitelist: allow https/http/file protocols (fixes "Protocol 'https' not on whitelist")
+        cmd = [
+            'ffmpeg',
+            '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+            '-i', url,
+            '-vframes', '1',
+            '-ss', '0',
+            '-y',  # overwrite
+            '-loglevel', 'error',  # reduce noise
+            output_path
+        ]
+        
+        # Run FFmpeg with timeout
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout + 10,  # Add buffer
+            check=False
+        )
+        
+        # Check if output file was created and is valid
+        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            try:
+                return Image.open(output_path)
+            except Exception:
+                return None
+        
+        return None
+        
+    except subprocess.TimeoutExpired:
+        return None
+    except FileNotFoundError:
+        # FFmpeg not found
+        return None
+    except Exception:
+        return None
+
+
 class VideoService:
     """Service để kiểm tra và thêm video vào Milvus"""
     
@@ -211,6 +282,25 @@ class VideoService:
         if max_retries is None:
             max_retries = VIDEO_EXTRACT_FRAME_RETRIES
         
+        # Check if URL is HLS manifest - for HLS, just extract first frame
+        if is_hls_manifest(video_url):
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+            try:
+                frame = extract_frame_from_hls(video_url, tmp_path, timeout=timeout_seconds)
+                if frame:
+                    return frame
+                else:
+                    print(f"⚠️  HLS manifest detected but FFmpeg extraction failed: {video_url}")
+                    return None
+            finally:
+                # Clean up temp file
+                try:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
+        
         retry_delay = 1
         
         for attempt in range(max_retries + 1):
@@ -315,6 +405,25 @@ class VideoService:
             timeout_seconds = VIDEO_EXTRACT_FRAME_TIMEOUT
         if max_retries is None:
             max_retries = VIDEO_EXTRACT_FRAME_RETRIES
+        
+        # Check if URL is HLS manifest
+        if is_hls_manifest(video_url):
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+            try:
+                frame = extract_frame_from_hls(video_url, tmp_path, timeout=timeout_seconds)
+                if frame:
+                    return frame
+                else:
+                    print(f"⚠️  HLS manifest detected but FFmpeg extraction failed: {video_url}")
+                    return None
+            finally:
+                # Clean up temp file
+                try:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
         
         retry_delay = 1
         

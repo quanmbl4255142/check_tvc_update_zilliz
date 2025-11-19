@@ -22,10 +22,11 @@ Hệ thống này xử lý video deduplication qua các bước:
 
 1. **Decode URLs**: Giải mã URLs từ CSV
 2. **Dedupe URLs**: Loại bỏ URL trùng lặp cơ bản (optional)
-3. **Tạo Collection**: Tạo collection trong Milvus/Zilliz
-4. **Upload Embeddings**: Extract embeddings từ video và upload lên Zilliz
-5. **Tìm Duplicates**: Sử dụng vector similarity search để tìm video trùng lặp
-6. **Clean Jobs**: Dọn dẹp các job folder rỗng (optional)
+3. **Filter Valid URLs**: Lọc các URL hợp lệ (loại bỏ 403/404) - **Khuyến nghị**
+4. **Tạo Collection**: Tạo collection trong Milvus/Zilliz
+5. **Upload Embeddings**: Extract embeddings từ video và upload lên Zilliz
+6. **Tìm Duplicates**: Sử dụng vector similarity search để tìm video trùng lặp
+7. **Clean Jobs**: Dọn dẹp các job folder rỗng (optional)
 
 ### ✨ Tính Năng Chính
 
@@ -69,13 +70,25 @@ Hệ thống này xử lý video deduplication qua các bước:
          │
          ▼
 ┌─────────────────┐
-│create_collection│  ← Bước 3: Tạo collection (nếu chưa có)
+│filter_valid_urls│  ← Bước 3: Lọc URL hợp lệ (loại bỏ 403/404)
 │      .py        │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│direct_upload_to │  ← Bước 4: Upload embeddings lên Zilliz
+│url-tvc.valid    │
+│     .csv        │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│create_collection│  ← Bước 4: Tạo collection (nếu chưa có)
+│      .py        │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│direct_upload_to │  ← Bước 5: Upload embeddings lên Zilliz
 │  _zilliz.py     │
 └────────┬────────┘
          │
@@ -87,7 +100,7 @@ Hệ thống này xử lý video deduplication qua các bước:
          │
          ▼
 ┌─────────────────┐
-│search_duplicates│  ← Bước 5: Tìm duplicates
+│search_duplicates│  ← Bước 6: Tìm duplicates
 │  _aggregated.py │
 └────────┬────────┘
          │
@@ -165,11 +178,53 @@ python dedupe_urls.py --input url-tvc.decoded.csv --output url-tvc.unique.csv --
 - `url-tvc.unique.csv`: URLs unique
 - `url-tvc.duplicates.csv`: URLs bị loại bỏ
 
-**Lưu ý:** Bước này chỉ loại bỏ URL string trùng lặp. Video có URL khác nhau nhưng nội dung giống nhau sẽ được xử lý ở bước 5.
+**Lưu ý:** Bước này chỉ loại bỏ URL string trùng lặp. Video có URL khác nhau nhưng nội dung giống nhau sẽ được xử lý ở bước 6.
 
 ---
 
-### Bước 3: Tạo Collection
+### Bước 3: Filter Valid URLs (Khuyến nghị)
+
+Lọc các URL hợp lệ, loại bỏ các URL bị 403 (Forbidden) hoặc 404 (Not Found) trước khi upload:
+
+```bash
+# Lọc toàn bộ file
+python filter_valid_urls.py --input url-tvc.unique.csv --output url-tvc.valid.csv --invalid url-tvc.invalid.csv
+
+# Lọc một phần (ví dụ: từ index 15500)
+python filter_valid_urls.py --input url-tvc.unique.csv --start 15500 --end 16000
+
+# Tùy chỉnh số workers và timeout (nhanh hơn)
+python filter_valid_urls.py --workers 20 --timeout 15
+```
+
+**Chức năng:**
+- Kiểm tra status code của từng URL bằng HEAD request (nhanh hơn GET)
+- Xử lý đa luồng với thread pool (mặc định 10 workers)
+- Tách file: URLs hợp lệ (200) và URLs lỗi (403/404/timeout)
+- Báo cáo chi tiết: số lượng 403, 404, timeout, v.v.
+
+**Tham số:**
+- `--input`: File CSV input (default: `url-tvc.unique.csv`)
+- `--output`: File CSV output chứa URLs hợp lệ (default: `url-tvc.valid.csv`)
+- `--invalid`: File CSV chứa URLs lỗi (default: `url-tvc.invalid.csv`)
+- `--column`: Tên cột chứa URLs (default: `decoded_url`)
+- `--start`: Index bắt đầu (default: 0)
+- `--end`: Index kết thúc (default: all)
+- `--workers`: Số lượng workers đồng thời (default: 10)
+- `--timeout`: Timeout cho mỗi request (seconds, default: 10)
+
+**Output:**
+- `url-tvc.valid.csv`: URLs hợp lệ (status 200)
+- `url-tvc.invalid.csv`: URLs lỗi với thông tin status code và error
+
+**Lưu ý:** 
+- Bước này giúp tiết kiệm thời gian và tài nguyên khi upload lên Zilliz
+- Nên chạy bước này trước khi upload, đặc biệt với dataset lớn
+- Sử dụng file `url-tvc.valid.csv` làm input cho bước upload
+
+---
+
+### Bước 4: Tạo Collection
 
 Tạo collection mới trong Milvus/Zilliz (nếu chưa có):
 
@@ -186,19 +241,19 @@ python create_collection.py --collection video_dedup_v2 --schema video_dedup
 
 ---
 
-### Bước 4: Upload Embeddings
+### Bước 5: Upload Embeddings
 
 Upload embeddings từ CSV lên Zilliz:
 
 ```bash
-# Upload toàn bộ
-python direct_upload_to_zilliz.py --input url-tvc.unique.csv --collection video_dedup_v2
+# Upload toàn bộ (sử dụng file đã lọc)
+python direct_upload_to_zilliz.py --input url-tvc.valid.csv --collection video_dedup_v2
 
 # Upload một phần (chunk)
-python direct_upload_to_zilliz.py --input url-tvc.unique.csv --collection video_dedup_v2 --start 0 --end 10000
+python direct_upload_to_zilliz.py --input url-tvc.valid.csv --collection video_dedup_v2 --start 0 --end 10000
 
 # Tiếp tục upload từ index 10000
-python direct_upload_to_zilliz.py --input url-tvc.unique.csv --collection video_dedup_v2 --start 10000 --end 20000
+python direct_upload_to_zilliz.py --input url-tvc.valid.csv --collection video_dedup_v2 --start 10000 --end 20000
 ```
 
 **Chức năng:**
@@ -217,9 +272,11 @@ python direct_upload_to_zilliz.py --input url-tvc.unique.csv --collection video_
 
 **Output:** Embeddings được lưu trong Zilliz collection
 
+**Lưu ý:** Nên sử dụng file `url-tvc.valid.csv` (đã lọc 403/404) thay vì `url-tvc.unique.csv` để tránh lãng phí thời gian xử lý các URL không hợp lệ.
+
 ---
 
-### Bước 5: Tìm Duplicates
+### Bước 6: Tìm Duplicates
 
 Tìm video trùng lặp dựa trên vector similarity:
 
@@ -280,7 +337,7 @@ python search_duplicates_aggregated.py \
 
 ---
 
-### Bước 6: Clean Empty Jobs (Optional)
+### Bước 7: Clean Empty Jobs (Optional)
 
 Dọn dẹp các job folder rỗng:
 
@@ -334,7 +391,30 @@ python clean_empty_jobs.py --root batch_outputs
 
 ---
 
-### 3. `create_collection.py`
+### 3. `filter_valid_urls.py`
+
+**Mục đích:** Lọc các URL hợp lệ, loại bỏ các URL bị 403/404 trước khi upload
+
+**Input:** `url-tvc.unique.csv` (hoặc file CSV chứa URLs)
+
+**Output:**
+- `url-tvc.valid.csv`: URLs hợp lệ (status 200)
+- `url-tvc.invalid.csv`: URLs lỗi với status code và error message
+
+**Chức năng:**
+- Kiểm tra status code bằng HEAD request (nhanh hơn GET)
+- Xử lý đa luồng với thread pool
+- Phân loại: 200 (OK), 403 (Forbidden), 404 (Not Found), timeout, lỗi khác
+- Báo cáo chi tiết số lượng từng loại lỗi
+
+**Ưu điểm:**
+- Tiết kiệm thời gian: Loại bỏ các URL không hợp lệ trước khi upload
+- Tiết kiệm tài nguyên: Không cần xử lý các URL bị 403/404
+- Xử lý nhanh: HEAD request + đa luồng
+
+---
+
+### 4. `create_collection.py`
 
 **Mục đích:** Tạo collection mới trong Milvus/Zilliz
 
@@ -350,7 +430,7 @@ python clean_empty_jobs.py --root batch_outputs
 
 ---
 
-### 4. `direct_upload_to_zilliz.py`
+### 5. `direct_upload_to_zilliz.py`
 
 **Mục đích:** Upload embeddings trực tiếp từ CSV lên Zilliz
 
@@ -370,7 +450,7 @@ python clean_empty_jobs.py --root batch_outputs
 
 ---
 
-### 5. `search_duplicates_aggregated.py`
+### 6. `search_duplicates_aggregated.py`
 
 **Mục đích:** Tìm video trùng lặp dựa trên vector similarity
 
@@ -412,7 +492,7 @@ python clean_empty_jobs.py --root batch_outputs
 
 ---
 
-### 6. `clean_empty_jobs.py`
+### 7. `clean_empty_jobs.py`
 
 **Mục đích:** Dọn dẹp các job folder rỗng
 
@@ -424,7 +504,7 @@ python clean_empty_jobs.py --root batch_outputs
 
 ---
 
-### 7. `create_product_embeddings_collection.py`
+### 8. `create_product_embeddings_collection.py`
 
 **Mục đích:** Tạo collection cho product embeddings (schema đặc biệt)
 
@@ -439,9 +519,12 @@ python clean_empty_jobs.py --root batch_outputs
 Nếu dataset > 10,000 videos, nên xử lý theo chunks:
 
 ```bash
-# Upload từng chunk
-python direct_upload_to_zilliz.py --input urls.csv --start 0 --end 10000
-python direct_upload_to_zilliz.py --input urls.csv --start 10000 --end 20000
+# Lọc URL hợp lệ trước (khuyến nghị)
+python filter_valid_urls.py --input urls.csv --output urls.valid.csv
+
+# Upload từng chunk (sử dụng file đã lọc)
+python direct_upload_to_zilliz.py --input urls.valid.csv --start 0 --end 10000
+python direct_upload_to_zilliz.py --input urls.valid.csv --start 10000 --end 20000
 # ...
 
 # Tìm duplicates từng chunk
@@ -517,9 +600,17 @@ python create_collection.py --collection video_dedup_v2 --schema video_dedup
 ### Upload chậm
 
 **Giải pháp:**
+- **Lọc URL hợp lệ trước**: Chạy `filter_valid_urls.py` để loại bỏ 403/404
 - Kiểm tra network connection
 - Đảm bảo video URLs accessible
 - Xử lý theo chunks nhỏ hơn để tránh timeout
+
+### Nhiều URL bị 403/404
+
+**Giải pháp:**
+- Chạy `filter_valid_urls.py` để lọc các URL hợp lệ trước khi upload
+- Sử dụng file `url-tvc.valid.csv` làm input cho `direct_upload_to_zilliz.py`
+- Kiểm tra file `url-tvc.invalid.csv` để xem các URL bị lỗi
 
 ---
 
@@ -561,15 +652,18 @@ python decode_urls.py --input url-tvc.csv --output url-tvc.decoded.csv
 # Bước 2: Dedupe URLs (optional)
 python dedupe_urls.py --input url-tvc.decoded.csv --output url-tvc.unique.csv
 
-# Bước 3: Tạo collection (nếu chưa có)
+# Bước 3: Lọc URL hợp lệ (khuyến nghị - loại bỏ 403/404)
+python filter_valid_urls.py --input url-tvc.unique.csv --output url-tvc.valid.csv --invalid url-tvc.invalid.csv
+
+# Bước 4: Tạo collection (nếu chưa có)
 python create_collection.py --collection video_dedup_v2 --schema video_dedup
 
-# Bước 4: Upload embeddings (xử lý từng chunk 10k)
-python direct_upload_to_zilliz.py --input url-tvc.unique.csv --collection video_dedup_v2 --start 0 --end 10000
-python direct_upload_to_zilliz.py --input url-tvc.unique.csv --collection video_dedup_v2 --start 10000 --end 20000
+# Bước 5: Upload embeddings (xử lý từng chunk 10k - sử dụng file đã lọc)
+python direct_upload_to_zilliz.py --input url-tvc.valid.csv --collection video_dedup_v2 --start 0 --end 10000
+python direct_upload_to_zilliz.py --input url-tvc.valid.csv --collection video_dedup_v2 --start 10000 --end 20000
 # ... tiếp tục cho đến hết
 
-# Bước 5: Tìm duplicates (xử lý từng chunk)
+# Bước 6: Tìm duplicates (xử lý từng chunk)
 python search_duplicates_aggregated.py \
     --collection video_dedup_v2 \
     --cosine_thresh 0.95 \
@@ -580,7 +674,7 @@ python search_duplicates_aggregated.py \
     --auto_clean \
     --fast_mode
 
-# Bước 6: Clean empty jobs (optional)
+# Bước 7: Clean empty jobs (optional)
 python clean_empty_jobs.py --root batch_outputs
 ```
 
