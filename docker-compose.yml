@@ -9,6 +9,9 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
     networks:
       - kafka-network
 
@@ -104,6 +107,8 @@ networks:
 
 volumes:
   kafka_data:
+  zookeeper_data:
+  zookeeper_log:
   redis_data:
     # Dùng lại volume cũ từ thư mục kafka để giữ dữ liệu
     external: true

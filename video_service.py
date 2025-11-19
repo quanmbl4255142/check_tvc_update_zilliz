@@ -147,6 +147,157 @@ class VideoService:
         except Exception:
             return 0
     
+    def calculate_frame_quality(self, frame: np.ndarray) -> float:
+        """
+        Tính toán chất lượng frame dựa trên độ sáng, contrast và sharpness
+        Returns: Quality score (0-1, cao hơn = tốt hơn)
+        """
+        try:
+            # Convert to grayscale nếu cần
+            if len(frame.shape) == 3:
+                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = frame
+            
+            # 1. Độ sáng (brightness) - tránh quá tối hoặc quá sáng
+            mean_brightness = np.mean(gray) / 255.0
+            brightness_score = 1.0 - abs(mean_brightness - 0.5) * 2  # Tốt nhất ở 0.5 (50% brightness)
+            
+            # 2. Contrast - độ tương phản
+            std_contrast = np.std(gray) / 255.0
+            contrast_score = min(std_contrast * 2, 1.0)  # Contrast cao hơn = tốt hơn (max 1.0)
+            
+            # 3. Sharpness - độ sắc nét (sử dụng Laplacian variance)
+            laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+            sharpness = laplacian.var()
+            sharpness_score = min(sharpness / 1000.0, 1.0)  # Normalize (max 1.0)
+            
+            # Weighted average
+            quality_score = (
+                brightness_score * 0.3 +
+                contrast_score * 0.4 +
+                sharpness_score * 0.3
+            )
+            
+            return float(quality_score)
+        except Exception:
+            return 0.5  # Default score nếu lỗi
+    
+    def extract_best_frame(
+        self, 
+        video_url: str, 
+        num_frames: int = 5,
+        frame_interval: int = 10,
+        timeout_seconds: int = None, 
+        max_retries: int = None
+    ) -> Optional[Image.Image]:
+        """
+        Extract nhiều frame và chọn frame có chất lượng tốt nhất
+        Giúp xử lý tốt hơn các video có frame đầu tiên tối/không rõ
+        
+        Args:
+            video_url: URL của video
+            num_frames: Số lượng frame để thử (mặc định 5)
+            frame_interval: Khoảng cách giữa các frame (mặc định 10 frames)
+            timeout_seconds: Timeout cho việc download video
+            max_retries: Số lần retry tối đa
+        
+        Returns:
+            PIL Image (frame tốt nhất) hoặc None nếu lỗi
+        """
+        # Sử dụng config nếu không chỉ định
+        if timeout_seconds is None:
+            timeout_seconds = VIDEO_EXTRACT_FRAME_TIMEOUT
+        if max_retries is None:
+            max_retries = VIDEO_EXTRACT_FRAME_RETRIES
+        
+        retry_delay = 1
+        
+        for attempt in range(max_retries + 1):
+            try:
+                start_time = time.time()
+                
+                # Thử mở trực tiếp từ URL
+                cap = cv2.VideoCapture(video_url)
+                
+                if not cap.isOpened():
+                    if attempt < max_retries:
+                        print(f"⚠️  Cannot open video URL (attempt {attempt + 1}/{max_retries + 1}): {video_url}, retrying...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    print(f"⚠️  Cannot open video URL: {video_url}")
+                    return None
+                
+                # Lấy thông tin video
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                
+                # Extract nhiều frame và đánh giá chất lượng
+                frames_with_quality = []
+                
+                for i in range(num_frames):
+                    frame_pos = i * frame_interval
+                    
+                    # Đảm bảo không vượt quá tổng số frame
+                    if total_frames > 0 and frame_pos >= total_frames:
+                        break
+                    
+                    # Seek đến frame
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+                    success, frame = cap.read()
+                    
+                    if success and frame is not None:
+                        # Tính chất lượng frame
+                        quality = self.calculate_frame_quality(frame)
+                        frames_with_quality.append((frame, quality, frame_pos))
+                
+                cap.release()
+                
+                # Check timeout
+                elapsed = time.time() - start_time
+                if elapsed > timeout_seconds:
+                    if attempt < max_retries:
+                        print(f"⚠️  Video processing timeout (attempt {attempt + 1}/{max_retries + 1}), retrying...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    print(f"⚠️  Video processing timeout after {elapsed:.1f}s")
+                    return None
+                
+                # Chọn frame tốt nhất
+                if frames_with_quality:
+                    best_frame, best_quality, best_pos = max(frames_with_quality, key=lambda x: x[1])
+                    print(f"📸 Selected best frame at position {best_pos} (quality: {best_quality:.3f})")
+                    
+                    # Convert to PIL Image
+                    rgb = cv2.cvtColor(best_frame, cv2.COLOR_BGR2RGB)
+                    return Image.fromarray(rgb)
+                else:
+                    # Fallback: thử frame đầu tiên
+                    print(f"⚠️  No frames extracted, trying first frame as fallback...")
+                    cap = cv2.VideoCapture(video_url)
+                    if cap.isOpened():
+                        cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+                        success, frame = cap.read()
+                        cap.release()
+                        if success and frame is not None:
+                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            return Image.fromarray(rgb)
+                    return None
+                
+            except Exception as e:
+                if attempt < max_retries:
+                    print(f"⚠️  Error extracting best frame (attempt {attempt + 1}/{max_retries + 1}): {e}, retrying...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                print(f"⚠️  Error extracting best frame: {e}")
+                # Fallback to first frame method
+                return self.extract_first_frame(video_url, timeout_seconds, max_retries)
+        
+        return None
+    
     def extract_first_frame(self, video_url: str, timeout_seconds: int = None, max_retries: int = None) -> Optional[Image.Image]:
         """
         Extract frame đầu tiên từ video URL với timeout và retry mechanism
@@ -238,16 +389,25 @@ class VideoService:
         
         return None
     
-    def create_embedding(self, video_url: str) -> Optional[np.ndarray]:
+    def create_embedding(self, video_url: str, use_best_frame: bool = True) -> Optional[np.ndarray]:
         """
-        Tạo CLIP embedding từ video URL (sử dụng frame đầu tiên)
+        Tạo CLIP embedding từ video URL
+        
+        Args:
+            video_url: URL của video
+            use_best_frame: Nếu True, extract nhiều frame và chọn frame tốt nhất
+                          Nếu False, chỉ dùng frame đầu tiên (nhanh hơn nhưng kém chính xác hơn)
         
         Returns:
             Normalized embedding vector (512 dims) hoặc None nếu lỗi
         """
         try:
-            # Extract first frame
-            frame = self.extract_first_frame(video_url)
+            # Extract frame (best frame hoặc first frame)
+            if use_best_frame:
+                frame = self.extract_best_frame(video_url)
+            else:
+                frame = self.extract_first_frame(video_url)
+            
             if frame is None:
                 return None
             
@@ -282,10 +442,19 @@ class VideoService:
         self,
         embedding: np.ndarray,
         top_k: int = None,
-        threshold: float = None
+        threshold: float = None,
+        use_fallback_threshold: bool = True
     ) -> list:
         """
         Tìm duplicates trong Milvus bằng vector similarity search
+        Hỗ trợ dynamic threshold fallback để phát hiện duplicate tốt hơn
+        khi video khác độ phân giải/kích thước
+        
+        Args:
+            embedding: Embedding vector để search
+            top_k: Số lượng kết quả tối đa
+            threshold: Similarity threshold (mặc định từ config)
+            use_fallback_threshold: Nếu True, thử lại với threshold thấp hơn nếu không tìm thấy
         
         Returns:
             List of results: [{"id": ..., "distance": ..., "url": ..., "job_id": ...}, ...]
@@ -294,7 +463,8 @@ class VideoService:
             self._connect()
         
         top_k = top_k or DEFAULT_TOP_K
-        threshold = threshold or DEFAULT_SIMILARITY_THRESHOLD
+        primary_threshold = threshold or DEFAULT_SIMILARITY_THRESHOLD
+        fallback_threshold = max(0.98, primary_threshold - 0.015)  # Giảm 0.015 nhưng không dưới 0.98
         
         try:
             # Search in Milvus
@@ -336,7 +506,7 @@ class VideoService:
                     # Higher IP = more similar
                     similarity = hit.distance
                     
-                    if similarity >= threshold:
+                    if similarity >= primary_threshold:
                         # Map fields based on schema type
                         if hasattr(self, 'has_product_schema') and self.has_product_schema:
                             # Schema: product_name, image_url
@@ -354,6 +524,46 @@ class VideoService:
                                 "url": hit.entity.get("url", ""),
                                 "job_id": hit.entity.get("job_id", "")
                             })
+            
+            # Dynamic threshold fallback: Nếu không tìm thấy với threshold cao,
+            # thử lại với threshold thấp hơn (để phát hiện duplicate khi khác độ phân giải)
+            if not duplicates and use_fallback_threshold and fallback_threshold < primary_threshold:
+                print(f"🔍 Không tìm thấy duplicate với threshold {primary_threshold:.4f}, thử lại với threshold {fallback_threshold:.4f}...")
+                
+                # Search lại với threshold thấp hơn
+                fallback_results = self.collection.search(
+                    data=[embedding.tolist()],
+                    anns_field="embedding",
+                    param=search_params,
+                    limit=top_k,
+                    output_fields=output_fields
+                )
+                
+                if fallback_results and len(fallback_results) > 0:
+                    for hit in fallback_results[0]:
+                        similarity = hit.distance
+                        
+                        if similarity >= fallback_threshold:
+                            # Map fields based on schema type
+                            if hasattr(self, 'has_product_schema') and self.has_product_schema:
+                                duplicates.append({
+                                    "id": hit.id,
+                                    "similarity": float(similarity),
+                                    "url": hit.entity.get("image_url", ""),
+                                    "job_id": hit.entity.get("product_name", ""),
+                                    "fallback_match": True  # Đánh dấu là match từ fallback threshold
+                                })
+                            else:
+                                duplicates.append({
+                                    "id": hit.id,
+                                    "similarity": float(similarity),
+                                    "url": hit.entity.get("url", ""),
+                                    "job_id": hit.entity.get("job_id", ""),
+                                    "fallback_match": True  # Đánh dấu là match từ fallback threshold
+                                })
+                    
+                    if duplicates:
+                        print(f"✅ Tìm thấy {len(duplicates)} duplicate(s) với fallback threshold {fallback_threshold:.4f}")
             
             return duplicates
             
@@ -449,10 +659,17 @@ class VideoService:
     def check_and_add_video(
         self,
         video_url: str,
-        similarity_threshold: float = None
+        similarity_threshold: float = None,
+        use_best_frame: bool = True
     ) -> Dict:
         """
         Kiểm tra video có duplicate không, nếu không thì thêm vào Milvus
+        Cải thiện để xử lý tốt hơn các video khác độ phân giải/kích thước
+        
+        Args:
+            video_url: URL của video
+            similarity_threshold: Threshold để phát hiện duplicate (mặc định từ config)
+            use_best_frame: Nếu True, extract nhiều frame và chọn frame tốt nhất
         
         Returns:
             {
@@ -461,14 +678,15 @@ class VideoService:
                 "unique_id": "url_XXXX" | None,
                 "similarity": float,
                 "message": str,
-                "error": str (if error)
+                "error": str (if error),
+                "fallback_match": bool (nếu dùng fallback threshold)
             }
         """
         similarity_threshold = similarity_threshold or DEFAULT_SIMILARITY_THRESHOLD
         
         try:
-            # Bước 1: Tạo embedding từ video
-            embedding = self.create_embedding(video_url)
+            # Bước 1: Tạo embedding từ video (sử dụng best frame để tăng độ chính xác)
+            embedding = self.create_embedding(video_url, use_best_frame=use_best_frame)
             if embedding is None:
                 return {
                     "status": "error",
@@ -479,23 +697,28 @@ class VideoService:
                     "error": "Embedding creation failed"
                 }
             
-            # Bước 2: Tìm duplicates trong Milvus
+            # Bước 2: Tìm duplicates trong Milvus (với fallback threshold)
             duplicates = self.search_duplicates(
                 embedding,
                 top_k=DEFAULT_TOP_K,
-                threshold=similarity_threshold
+                threshold=similarity_threshold,
+                use_fallback_threshold=True  # Bật fallback để phát hiện duplicate tốt hơn
             )
             
             if duplicates:
                 # Video đã tồn tại (TVC CŨ)
                 best_match = duplicates[0]  # Highest similarity
+                is_fallback = best_match.get("fallback_match", False)
+                
                 return {
                     "status": "success",
                     "is_new": False,
                     "unique_id": best_match["job_id"],  # product_name
                     "similarity": best_match["similarity"],
-                    "message": f"Video đã tồn tại (similarity: {best_match['similarity']:.4f})",
-                    "duplicate_url": best_match["url"]  # image_url
+                    "message": f"Video đã tồn tại (similarity: {best_match['similarity']:.4f})" + 
+                              (" - Phát hiện bằng fallback threshold" if is_fallback else ""),
+                    "duplicate_url": best_match["url"],  # image_url
+                    "fallback_match": is_fallback
                 }
             else:
                 # Video mới (TVC MỚI) - Thêm vào Milvus
