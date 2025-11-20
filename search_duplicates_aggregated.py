@@ -1543,7 +1543,9 @@ def search_duplicates_aggregated(
     
     # CRITICAL FIX: Save count before clearing all_data for memory cleanup
     # We need this count for performance report later
-    total_videos_processed = len(all_data)
+    # Use len(video_info) instead of len(all_data) because all_data may have been filtered
+    # video_info contains the actual videos that were processed in the search phase
+    total_videos_processed = len(video_info)
     
     # CRITICAL FIX: Clear all_data after search to free memory
     # We no longer need the full embeddings list, only video_info (which has URLs)
@@ -1699,7 +1701,8 @@ def search_duplicates_aggregated(
     graph: Dict[str, Set[str]] = {}
     
     # Initialize graph (exclude cross-chunk duplicates from clustering)
-    for job_id in all_job_ids:
+    # CRITICAL FIX: Sort to ensure deterministic iteration order
+    for job_id in sorted(all_job_ids, key=lambda jid: extract_job_id_number(jid)):
         if job_id not in cross_chunk_duplicates:
             graph[job_id] = set()
     
@@ -1760,7 +1763,9 @@ def search_duplicates_aggregated(
             cluster.add(node)
             
             # Add neighbors to stack with updated path
-            for neighbor in graph.get(node, set()):
+            # CRITICAL FIX: Sort neighbors to ensure deterministic order
+            neighbors = sorted(graph.get(node, set()), key=lambda jid: extract_job_id_number(jid))
+            for neighbor in neighbors:
                 if neighbor not in visited and neighbor not in path:
                     new_path = path + [neighbor]
                     stack.append((neighbor, new_path, min_sim))
@@ -1784,7 +1789,9 @@ def search_duplicates_aggregated(
             cluster.add(node)
             
             # Add all neighbors to stack
-            for neighbor in graph.get(node, set()):
+            # CRITICAL FIX: Sort neighbors to ensure deterministic order
+            neighbors = sorted(graph.get(node, set()), key=lambda jid: extract_job_id_number(jid))
+            for neighbor in neighbors:
                 if neighbor not in visited:
                     stack.append(neighbor)
         
@@ -1795,7 +1802,8 @@ def search_duplicates_aggregated(
     print(f"   🔍 Finding connected components (clusters with path validation)...")
     use_validated_dfs = True  # Enable path-based validation by default
     
-    for job_id in all_job_ids:
+    # CRITICAL FIX: Sort to ensure deterministic iteration order (same clusters every run)
+    for job_id in sorted(all_job_ids, key=lambda jid: extract_job_id_number(jid)):
         if job_id not in visited and job_id not in cross_chunk_duplicates:
             if use_validated_dfs:
                 cluster = dfs_iterative_with_validation(job_id, max_path_length=3)
@@ -1926,7 +1934,8 @@ def search_duplicates_aggregated(
         print(f"   ℹ️  No standalone videos (all {len(all_job_ids)} videos have duplicates)")
     
     # Add cross-chunk duplicates to duplicates list
-    for duplicate_job_id in cross_chunk_duplicates:
+    # CRITICAL FIX: Sort to ensure deterministic order
+    for duplicate_job_id in sorted(cross_chunk_duplicates, key=lambda jid: extract_job_id_number(jid)):
         original_job_id, similarity = cross_chunk_originals[duplicate_job_id]
         duplicates.append({
             "duplicate_url": video_info[duplicate_job_id]["url"],

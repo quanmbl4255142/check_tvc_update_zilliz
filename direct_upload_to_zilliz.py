@@ -60,7 +60,7 @@ def is_hls_manifest(url: str) -> bool:
     )
 
 
-def extract_frame_from_hls(url: str, output_path: str, timeout: int = 60) -> bool:
+def extract_frame_from_hls(url: str, output_path: str, timeout: int = 60) -> tuple[bool, Optional[str]]:
     """
     Extract first frame from HLS manifest using FFmpeg
     
@@ -70,7 +70,9 @@ def extract_frame_from_hls(url: str, output_path: str, timeout: int = 60) -> boo
         timeout: Timeout in seconds
     
     Returns:
-        True if successful, False otherwise
+        (success: bool, error_message: Optional[str])
+        - success=True, error_message=None: Thành công
+        - success=False, error_message=str: Thất bại, có error message cụ thể
     """
     try:
         import subprocess
@@ -78,7 +80,7 @@ def extract_frame_from_hls(url: str, output_path: str, timeout: int = 60) -> boo
         
         # Check if ffmpeg is available
         if not shutil.which('ffmpeg'):
-            return False
+            return (False, "FFmpeg not found in PATH")
         
         # Use FFmpeg to extract first frame from HLS stream
         # -protocol_whitelist: allow https/http/file protocols (fixes "Protocol 'https' not on whitelist")
@@ -86,7 +88,7 @@ def extract_frame_from_hls(url: str, output_path: str, timeout: int = 60) -> boo
         # -vframes 1: extract only 1 frame
         # -ss 0: start at 0 seconds
         # -y: overwrite output file
-        # -loglevel error: reduce output noise
+        # -loglevel error: reduce output noise (nhưng vẫn log errors)
         cmd = [
             'ffmpeg',
             '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
@@ -94,7 +96,7 @@ def extract_frame_from_hls(url: str, output_path: str, timeout: int = 60) -> boo
             '-vframes', '1',
             '-ss', '0',
             '-y',  # overwrite
-            '-loglevel', 'error',  # reduce noise
+            '-loglevel', 'error',  # reduce noise nhưng vẫn hiển thị errors
             output_path
         ]
         
@@ -109,17 +111,42 @@ def extract_frame_from_hls(url: str, output_path: str, timeout: int = 60) -> boo
         
         # Check if output file was created and is valid
         if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            return True
+            # Verify it's a valid image
+            try:
+                from PIL import Image
+                img = Image.open(output_path)
+                img.verify()
+                return (True, None)
+            except Exception as e:
+                error_msg = f"Invalid image file created: {str(e)}"
+                return (False, error_msg)
         
-        return False
+        # FFmpeg failed - read stderr để biết lỗi cụ thể
+        error_output = result.stderr.decode('utf-8', errors='ignore').strip()
         
-    except subprocess.TimeoutExpired:
-        return False
+        if not error_output:
+            error_msg = f"FFmpeg failed with return code {result.returncode} (no error message)"
+        else:
+            # Lấy dòng lỗi quan trọng nhất (thường là dòng cuối)
+            error_lines = [line.strip() for line in error_output.split('\n') if line.strip()]
+            if error_lines:
+                # Ưu tiên dòng có "Error" hoặc "error"
+                important_lines = [line for line in error_lines if 'error' in line.lower() or 'Error' in line]
+                if important_lines:
+                    error_msg = important_lines[-1]  # Lấy dòng cuối cùng
+                else:
+                    error_msg = error_lines[-1]  # Lấy dòng cuối cùng nếu không có "error"
+            else:
+                error_msg = f"FFmpeg failed with return code {result.returncode}"
+        
+        return (False, error_msg)
+        
+    except subprocess.TimeoutExpired as e:
+        return (False, f"FFmpeg timeout after {timeout + 10} seconds")
     except FileNotFoundError:
-        # FFmpeg not found
-        return False
-    except Exception:
-        return False
+        return (False, "FFmpeg executable not found")
+    except Exception as e:
+        return (False, f"Unexpected error: {str(e)}")
 
 
 def read_urls_from_csv(csv_path: str, column: Optional[str]) -> List[str]:
@@ -276,7 +303,8 @@ def extract_first_frame_embedding(url: str, verbose: bool = False) -> tuple[Opti
             temp_npy_path = os.path.join(tdir, "embedding.npy")
             
             # Try FFmpeg to extract frame from HLS
-            if extract_frame_from_hls(url, temp_img_path, timeout=60):
+            success, ffmpeg_error = extract_frame_from_hls(url, temp_img_path, timeout=60)
+            if success:
                 try:
                     # Verify image was created
                     if os.path.exists(temp_img_path) and os.path.getsize(temp_img_path) > 0:
@@ -296,7 +324,11 @@ def extract_first_frame_embedding(url: str, verbose: bool = False) -> tuple[Opti
                 except Exception as e:
                     error_messages.append(f"Embedding creation failed from HLS: {str(e)}")
             else:
-                error_messages.append("HLS manifest detected but FFmpeg extraction failed (FFmpeg may not be installed or URL is invalid)")
+                # FFmpeg failed - log error message cụ thể
+                if ffmpeg_error:
+                    error_messages.append(f"FFmpeg extraction failed: {ffmpeg_error}")
+                else:
+                    error_messages.append("HLS manifest detected but FFmpeg extraction failed (unknown error)")
             
             # If FFmpeg failed, return early with clear error
             final_error = "; ".join(error_messages) if error_messages else "HLS manifest not supported"
@@ -304,51 +336,67 @@ def extract_first_frame_embedding(url: str, verbose: bool = False) -> tuple[Opti
     
     with tempfile.TemporaryDirectory() as tdir:
         # METHOD 1: Try opening directly from URL
+        # Suppress OpenCV warnings (như "Could not find decoder for codec_id=61")
+        # vì chúng ta sẽ fallback sang download method nếu OpenCV fail
+        import warnings
+        import sys
+        from io import StringIO
+        
         try:
-            cap = cv2.VideoCapture(url)
-            if cap.isOpened():
-                # Set timeout for reading (some URLs hang)
-                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 30000)  # 30 seconds
-                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 30000)  # 30 seconds
-                
-                cap.set(cv2.CAP_PROP_POS_MSEC, 0)
-                success, frame = cap.read()
-                
-                if success and frame is not None:
-                    # Check if frame is valid
-                    if frame.size == 0:
-                        error_messages.append("Frame is empty")
-                        cap.release()
+            # Tạm thời redirect stderr để suppress OpenCV warnings
+            old_stderr = sys.stderr
+            sys.stderr = StringIO()
+            
+            try:
+                cap = cv2.VideoCapture(url)
+                if cap.isOpened():
+                    # Set timeout for reading (some URLs hang)
+                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 30000)  # 30 seconds
+                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 30000)  # 30 seconds
+                    
+                    cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+                    success, frame = cap.read()
+                    
+                    if success and frame is not None:
+                        # Check if frame is valid
+                        if frame.size == 0:
+                            error_messages.append("Frame is empty")
+                            cap.release()
+                        else:
+                            temp_img_path = os.path.join(tdir, "frame.png")
+                            temp_npy_path = os.path.join(tdir, "embedding.npy")
+                            
+                            try:
+                                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                img = Image.fromarray(rgb)
+                                img.save(temp_img_path)
+                                
+                                # Create embedding
+                                embed_image_clip_to_npy(temp_img_path, temp_npy_path, model_id="openai/clip-vit-base-patch32")
+                                
+                                # Load and normalize
+                                vec = np.load(temp_npy_path).astype(np.float32).flatten()
+                                norm = np.linalg.norm(vec)
+                                if norm > 0:
+                                    vec = vec / norm
+                                    cap.release()
+                                    sys.stderr = old_stderr  # Restore stderr
+                                    return (vec, None)
+                                else:
+                                    error_messages.append("Embedding norm is zero")
+                            except Exception as e:
+                                error_messages.append(f"Embedding creation failed: {str(e)}")
+                            
+                            cap.release()
                     else:
-                        temp_img_path = os.path.join(tdir, "frame.png")
-                        temp_npy_path = os.path.join(tdir, "embedding.npy")
-                        
-                        try:
-                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            img = Image.fromarray(rgb)
-                            img.save(temp_img_path)
-                            
-                            # Create embedding
-                            embed_image_clip_to_npy(temp_img_path, temp_npy_path, model_id="openai/clip-vit-base-patch32")
-                            
-                            # Load and normalize
-                            vec = np.load(temp_npy_path).astype(np.float32).flatten()
-                            norm = np.linalg.norm(vec)
-                            if norm > 0:
-                                vec = vec / norm
-                                cap.release()
-                                return (vec, None)
-                            else:
-                                error_messages.append("Embedding norm is zero")
-                        except Exception as e:
-                            error_messages.append(f"Embedding creation failed: {str(e)}")
-                        
+                        error_messages.append("Failed to read frame from URL (direct access - may be HEVC codec)")
                         cap.release()
                 else:
-                    error_messages.append("Failed to read frame from URL (direct access)")
-                    cap.release()
-            else:
-                error_messages.append("Failed to open URL with OpenCV (direct access)")
+                    error_messages.append("Failed to open URL with OpenCV (direct access - may be unsupported codec)")
+            finally:
+                # Restore stderr
+                sys.stderr = old_stderr
+                
         except cv2.error as e:
             error_messages.append(f"OpenCV error (direct access): {str(e)}")
         except Exception as e:
