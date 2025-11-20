@@ -1,12 +1,14 @@
 import argparse
 import csv
+import math
 import os
 import sys
 import tempfile
 import time
-from typing import Optional
+from typing import Optional, List
 
 import cv2
+import numpy as np
 from PIL import Image
 
 from app import ensure_dir, embed_image_clip_to_npy
@@ -96,24 +98,149 @@ def extract_frame_at_position(cap: cv2.VideoCapture, position: float) -> Optiona
     return None
 
 
-def process_url(index: int, url: str, out_root: str, overwrite: bool, num_frames: int = 3) -> tuple[str, int, Optional[str]]:
+def get_video_duration(cap: cv2.VideoCapture) -> float:
+    """Get video duration in seconds"""
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        if fps > 0 and frame_count > 0:
+            return frame_count / fps
+    except Exception:
+        pass
+    return 0.0
+
+
+def calculate_frame_positions(duration_seconds: float) -> List[float]:
     """
-    Process a video URL and extract embeddings from multiple frames.
+    Calculate frame positions (0.0-1.0) to extract based on video duration.
+    
+    Strategy:
+    - Video < 30s: 5 frames (0%, 25%, 50%, 75%, 90%)
+    - Video 30s-2min: 10 frames (distributed evenly, avoid 100% to skip credits)
+    - Video > 2min: 15 frames (distributed evenly, avoid 100%)
+    """
+    if duration_seconds < 30:
+        # 5 frames: 0%, 25%, 50%, 75%, 90%
+        return [0.0, 0.25, 0.5, 0.75, 0.9]
+    elif duration_seconds < 120:  # 2 minutes
+        # 10 frames: distributed evenly (0% to 90%)
+        num_frames = 10
+        return [i / (num_frames - 1) * 0.9 for i in range(num_frames)]
+    else:
+        # 15 frames: distributed evenly (0% to 90%)
+        num_frames = 15
+        return [i / (num_frames - 1) * 0.9 for i in range(num_frames)]
+
+
+def extract_frames_distributed(cap: cv2.VideoCapture) -> List[Image.Image]:
+    """
+    Extract frames distributed evenly across video duration.
+    Returns list of PIL Images.
+    """
+    frames = []
+    duration = get_video_duration(cap)
+    if duration <= 0:
+        # Fallback: try to get first frame
+        cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+        success, frame = cap.read()
+        if success and frame is not None:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(Image.fromarray(rgb))
+        return frames
+    
+    positions = calculate_frame_positions(duration)
+    for pos in positions:
+        img = extract_frame_at_position(cap, pos)
+        if img:
+            frames.append(img)
+    
+    return frames
+
+
+def create_thumbnail_grid(frames: List[Image.Image], target_size: int = 224) -> Image.Image:
+    """
+    Create a grid thumbnail from multiple frames.
     
     Args:
-        num_frames: 1 (fast, only first frame) or 3 (robust, first/middle/last frames)
+        frames: List of PIL Images
+        target_size: Size to resize each frame before arranging (default: 224)
+    
+    Returns:
+        Combined thumbnail as PIL Image
+    """
+    if not frames:
+        # Return a blank image if no frames
+        return Image.new('RGB', (target_size, target_size), color='black')
+    
+    if len(frames) == 1:
+        # Single frame: just resize
+        return frames[0].resize((target_size, target_size), Image.Resampling.LANCZOS)
+    
+    # Calculate grid dimensions
+    num_frames = len(frames)
+    if num_frames <= 4:
+        cols = 2
+        rows = 2
+    elif num_frames <= 9:
+        cols = 3
+        rows = 3
+    elif num_frames <= 16:
+        cols = 4
+        rows = 4
+    else:
+        # For 15 frames: 4x4 grid (last cell empty)
+        cols = 4
+        rows = 4
+    
+    # Resize all frames to target_size
+    resized_frames = []
+    for frame in frames:
+        # Resize maintaining aspect ratio, then crop to square
+        frame.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
+        # Create square image with black padding if needed
+        square = Image.new('RGB', (target_size, target_size), color='black')
+        # Center the frame
+        x_offset = (target_size - frame.width) // 2
+        y_offset = (target_size - frame.height) // 2
+        square.paste(frame, (x_offset, y_offset))
+        resized_frames.append(square)
+    
+    # Create grid
+    grid_width = cols * target_size
+    grid_height = rows * target_size
+    grid = Image.new('RGB', (grid_width, grid_height), color='black')
+    
+    # Paste frames into grid
+    for idx, frame in enumerate(resized_frames):
+        if idx >= cols * rows:
+            break
+        row = idx // cols
+        col = idx % cols
+        x = col * target_size
+        y = row * target_size
+        grid.paste(frame, (x, y))
+    
+    return grid
+
+
+def process_url(index: int, url: str, out_root: str, overwrite: bool, num_frames: int = 3) -> tuple[str, int, Optional[str]]:
+    """
+    Process a video URL: extract frames distributed across video, create thumbnail grid, and embed.
+    
+    Args:
+        num_frames: 1 (fast, only first frame) or use distributed sampling (5-15 frames based on duration)
+                   Note: num_frames > 1 now uses distributed sampling and creates thumbnail grid
     """
     job_id = f"url_{index:04d}"
     job_dir = os.path.join(out_root, job_id)
     
-    # Define frame paths based on num_frames
-    frame_names = ["first_frame.npy", "middle_frame.npy", "last_frame.npy"]
-    embed_paths = [os.path.join(job_dir, name) for name in frame_names[:num_frames]]
+    # Output: single embedding file (from thumbnail grid)
+    embed_path = os.path.join(job_dir, "thumbnail_embedding.npy")
     url_txt_path = os.path.join(job_dir, "url.txt")
     
     ensure_dir(job_dir)
     if overwrite:
-        for path in embed_paths + [url_txt_path]:
+        for path in [embed_path, url_txt_path]:
             try:
                 if os.path.exists(path):
                     os.remove(path)
@@ -129,7 +256,6 @@ def process_url(index: int, url: str, out_root: str, overwrite: bool, num_frames
 
     with tempfile.TemporaryDirectory() as tdir:
         # METHOD 1: Thử mở trực tiếp từ URL (không cần download)
-        frames_extracted = 0
         try:
             cap = cv2.VideoCapture(url)
             if cap.isOpened():
@@ -142,22 +268,25 @@ def process_url(index: int, url: str, out_root: str, overwrite: bool, num_frames
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         img = Image.fromarray(rgb)
                         img.save(temp_path)
-                        embed_image_clip_to_npy(temp_path, embed_paths[0], model_id="openai/clip-vit-base-patch32")
-                        frames_extracted = 1
+                        embed_image_clip_to_npy(temp_path, embed_path, model_id="openai/clip-vit-base-patch32")
+                        cap.release()
+                        return job_id, 1, None
                 else:
-                    # Robust mode: 3 frames (first, middle, last)
-                    positions = [0.0, 0.5, 0.9]  # 0%, 50%, 90% (avoid credits at 100%)
-                    for i, pos in enumerate(positions):
-                        img = extract_frame_at_position(cap, pos)
-                        if img:
-                            temp_path = os.path.join(tdir, f"frame_{i}.png")
-                            img.save(temp_path)
-                            embed_image_clip_to_npy(temp_path, embed_paths[i], model_id="openai/clip-vit-base-patch32")
-                            frames_extracted += 1
-                
-                cap.release()
-                if frames_extracted > 0:
-                    return job_id, frames_extracted, None
+                    # New mode: extract frames distributed across video, create thumbnail, embed
+                    frames = extract_frames_distributed(cap)
+                    cap.release()
+                    
+                    if frames:
+                        # Create thumbnail grid from frames
+                        thumbnail = create_thumbnail_grid(frames, target_size=224)
+                        thumbnail_path = os.path.join(tdir, "thumbnail.png")
+                        thumbnail.save(thumbnail_path)
+                        
+                        # Embed the thumbnail
+                        embed_image_clip_to_npy(thumbnail_path, embed_path, model_id="openai/clip-vit-base-patch32")
+                        return job_id, len(frames), None
+                    else:
+                        return job_id, 0, "no_frames_extracted"
         except Exception:
             pass  # Nếu thất bại, thử phương án 2
         
@@ -169,7 +298,6 @@ def process_url(index: int, url: str, out_root: str, overwrite: bool, num_frames
             return job_id, 0, f"download_error: {e}"
 
         # Extract frames from downloaded video
-        frames_extracted = 0
         try:
             cap = cv2.VideoCapture(tmp_path)
             if not cap.isOpened():
@@ -184,28 +312,30 @@ def process_url(index: int, url: str, out_root: str, overwrite: bool, num_frames
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     img = Image.fromarray(rgb)
                     img.save(temp_path)
-                    embed_image_clip_to_npy(temp_path, embed_paths[0], model_id="openai/clip-vit-base-patch32")
-                    frames_extracted = 1
+                    embed_image_clip_to_npy(temp_path, embed_path, model_id="openai/clip-vit-base-patch32")
+                    cap.release()
+                    return job_id, 1, None
             else:
-                # Robust mode: 3 frames
-                positions = [0.0, 0.5, 0.9]
-                for i, pos in enumerate(positions):
-                    img = extract_frame_at_position(cap, pos)
-                    if img:
-                        temp_path = os.path.join(tdir, f"frame_{i}.png")
-                        img.save(temp_path)
-                        embed_image_clip_to_npy(temp_path, embed_paths[i], model_id="openai/clip-vit-base-patch32")
-                        frames_extracted += 1
-            
-            cap.release()
-            
-            if frames_extracted == 0:
-                return job_id, 0, "no_frames_extracted"
+                # New mode: extract frames distributed across video, create thumbnail, embed
+                frames = extract_frames_distributed(cap)
+                cap.release()
+                
+                if frames:
+                    # Create thumbnail grid from frames
+                    thumbnail = create_thumbnail_grid(frames, target_size=224)
+                    thumbnail_path = os.path.join(tdir, "thumbnail.png")
+                    thumbnail.save(thumbnail_path)
+                    
+                    # Embed the thumbnail
+                    embed_image_clip_to_npy(thumbnail_path, embed_path, model_id="openai/clip-vit-base-patch32")
+                    return job_id, len(frames), None
+                else:
+                    return job_id, 0, "no_frames_extracted"
                 
         except Exception as e:
             return job_id, 0, f"frame_extract_error: {e}"
 
-    return job_id, frames_extracted, None
+    return job_id, 0, "unknown_error"
 
 
 def main() -> None:
@@ -216,8 +346,8 @@ def main() -> None:
     parser.add_argument("--start", type=int, default=0, help="Start index (inclusive) in URL list (default: 0)")
     parser.add_argument("--end", type=int, default=None, help="End index (exclusive) in URL list (default: None)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing frames for a job")
-    parser.add_argument("--num_frames", type=int, default=1, choices=[1, 3], 
-                       help="Number of frames to extract: 1=fast (first only), 3=robust (first/middle/last, better for watermarks/crops) (default: 1)")
+    parser.add_argument("--num_frames", type=int, default=1, 
+                       help="Frame extraction mode: 1=fast (first frame only), >1=distributed sampling (5-15 frames based on video duration, creates thumbnail grid for better accuracy) (default: 1)")
     args = parser.parse_args()
 
     # Validate input file exists
@@ -242,7 +372,7 @@ def main() -> None:
         print("No URLs to process in the given range.", file=sys.stderr)
         sys.exit(1)
 
-    mode_desc = "first frame only" if args.num_frames == 1 else "3 frames (first/middle/last) for better accuracy"
+    mode_desc = "first frame only" if args.num_frames == 1 else "distributed frames (5-15 frames based on duration) -> thumbnail grid -> embed"
     print(f"🎬 Processing URLs {start}..{end-1} out of {len(urls)} total")
     print(f"📊 Mode: {mode_desc}")
     successes = 0

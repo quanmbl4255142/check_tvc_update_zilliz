@@ -1,6 +1,6 @@
 """
-Upload video embeddings to Milvus - 1 frame per video
-Load first_frame.npy and upload to Zilliz (1 vector per video)
+Upload video embeddings to Milvus - 1 thumbnail per video
+Load thumbnail_embedding.npy (from distributed frames grid) and upload to Zilliz (1 vector per video)
 """
 
 import argparse
@@ -43,12 +43,18 @@ def load_url(job_dir: str) -> str:
 
 def load_embedding(job_dir: str) -> np.ndarray:
     """
-    Load first frame embedding from job directory
+    Load thumbnail embedding from job directory
+    Supports both new format (thumbnail_embedding.npy) and old format (first_frame.npy) for backward compatibility
     
     Returns:
         Normalized embedding vector (512 dims) or None if not found
     """
-    npy_path = os.path.join(job_dir, "first_frame.npy")
+    # Try new format first (thumbnail from distributed frames)
+    npy_path = os.path.join(job_dir, "thumbnail_embedding.npy")
+    
+    # Fallback to old format for backward compatibility
+    if not os.path.exists(npy_path):
+        npy_path = os.path.join(job_dir, "first_frame.npy")
     
     if not os.path.exists(npy_path):
         return None
@@ -99,13 +105,13 @@ def create_collection_if_not_exists(collection_name: str) -> Collection:
             name="embedding",
             dtype=DataType.FLOAT_VECTOR,
             dim=EMBEDDING_DIM,
-            description="CLIP embedding from first frame"
+            description="CLIP embedding from thumbnail grid (distributed frames)"
         ),
     ]
     
     schema = CollectionSchema(
         fields,
-        description="Video embeddings (1 vector per video, first frame only)"
+        description="Video embeddings (1 vector per video, thumbnail grid from distributed frames)"
     )
     
     collection = Collection(
@@ -179,7 +185,7 @@ def upload_vectors(
             skipped += 1
             continue
         
-        # Load embedding from first frame
+        # Load embedding from thumbnail (or first frame for backward compatibility)
         embedding_vec = load_embedding(job_dir)
         
         if embedding_vec is None:
@@ -223,14 +229,14 @@ def upload_vectors(
     print(f"\n✅ Upload complete!")
     print(f"   Total vectors: {final_count}")
     print(f"   Skipped: {skipped}")
-    print(f"   Mode: 1 frame per video (first_frame.npy)")
+    print(f"   Mode: 1 thumbnail per video (thumbnail_embedding.npy or first_frame.npy)")
     
     return final_count, skipped
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Upload video embeddings to Milvus (1 vector per video, first frame only)"
+        description="Upload video embeddings to Milvus (1 vector per video, thumbnail grid from distributed frames)"
     )
     parser.add_argument(
         "--root",
@@ -256,9 +262,9 @@ def main():
     
     # Print config
     print_config()
-    print(f"\n🎯 Upload mode: 1 frame per video")
-    print(f"   → Loads first_frame.npy from each job directory")
-    print(f"   → 1 vector per video (simple and fast)")
+    print(f"\n🎯 Upload mode: 1 thumbnail per video")
+    print(f"   → Loads thumbnail_embedding.npy from each job directory (or first_frame.npy for backward compatibility)")
+    print(f"   → 1 vector per video (thumbnail grid from 5-15 distributed frames)")
     
     if args.config_only:
         return
@@ -278,7 +284,7 @@ def main():
         
         if total > 0:
             print(f"\n🎉 Successfully uploaded {total} vectors!")
-            print(f"   → 1 vector per video (from first_frame.npy)")
+            print(f"   → 1 vector per video (from thumbnail_embedding.npy or first_frame.npy)")
         else:
             print("\n⚠️  No vectors were uploaded.")
             

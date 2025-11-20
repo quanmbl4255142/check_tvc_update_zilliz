@@ -18,7 +18,9 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
+# thư viện psutil dùng để track performance(RAM, CPU, time) nhằm mục đích để tính toán hiệu suất của chương trình
 import psutil
+
 from tqdm import tqdm
 
 # pymilvus dùng để kết nối với zilliz và milvus
@@ -42,22 +44,23 @@ class PerformanceTracker:
     """Track performance metrics: timing, RAM, CPU"""
     
     def __init__(self):
+        # psutil.Process() là đối tượng đại diện cho quá trình hiện tại của chương trình nhằm mục đích để track performance(RAM, CPU, time)
         self.process = psutil.Process()
-        self.start_time = time.time()
-        self.phase_times = {}
-        self.phase_start = None
-        self.current_phase = None
-        
-        # Initial stats
-        self.initial_ram_mb = self.process.memory_info().rss / 1024 / 1024
-        self.peak_ram_mb = self.initial_ram_mb
-        self.cpu_samples = []
-        
+        self.start_time = time.time() # thời gian bắt đầu của chương trình
+        self.phase_times = {} # thời gian của từng pha nghĩa là dict chứa tên pha và thời gian của pha đó(pha là các bước của chương trình)
+        self.phase_start = None # thời gian bắt đầu của pha hiện tại
+        self.current_phase = None # tên của pha(bước hiện tại)hiện tại
+        self.initial_ram_mb = self.process.memory_info().rss / 1024 / 1024 # RAM ban đầu
+        self.peak_ram_mb = self.initial_ram_mb # RAM peak(cực đại) nghĩa là 
+        self.cpu_samples = [] # mảng chứa các mẫu CPU samples(các giá trị CPU tại các thời điểm khác nhau)
+    
+    # start_phase là hàm để bắt đầu track một bước cụ thể của chương trình
     def start_phase(self, phase_name: str):
         """Start tracking a phase"""
-        self.current_phase = phase_name
-        self.phase_start = time.time()
+        self.current_phase = phase_name # tên của pha hiện tại
+        self.phase_start = time.time() # thời gian bắt đầu của pha hiện tại
         
+    # end_phase làm hàm để kết thúc track(track ở đây là thời gian thực hiện của 1 chương trình) một bước cụ thể của chương trình
     def end_phase(self):
         """End current phase and record time"""
         if self.phase_start and self.current_phase:

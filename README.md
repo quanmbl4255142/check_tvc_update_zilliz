@@ -32,6 +32,8 @@ Hệ thống này xử lý video deduplication qua các bước:
 
 - ✅ **Xử lý khác độ phân giải**: Tự động chọn video có resolution cao nhất (1080p > 720p > 480p)
 - ✅ **Xử lý khung hình to nhỏ**: Dùng embeddings để so sánh nội dung, không phụ thuộc kích thước pixel
+- ✅ **Distributed frame sampling**: Lấy 5-15 frames đều đặn trong video và ghép thành thumbnail grid để tăng độ chính xác
+- ✅ **Nhận diện tốt hơn**: Thumbnail grid giúp nhận diện video trùng lặp dù có intro/logo khác nhau
 - ✅ **Pre-filtering thông minh**: Loại bỏ cùng video ID với signature/itag khác nhau
 - ✅ **Cross-chunk detection**: Phát hiện duplicates giữa các chunks
 - ✅ **Batch processing**: Xử lý song song với nhiều threads
@@ -262,9 +264,16 @@ python direct_upload_to_zilliz.py --input url-tvc.valid.csv --collection video_d
 
 **Chức năng:**
 - Đọc URLs từ CSV
-- Extract frame đầu tiên từ video
-- Tạo CLIP embedding (512 dimensions)
+- Extract frames đều đặn từ video (5-15 frames tùy độ dài video)
+- Ghép các frames thành thumbnail grid (1 ảnh lớn chứa tất cả frames)
+- Tạo CLIP embedding từ thumbnail grid (512 dimensions)
 - Upload lên Zilliz với batch size tự động
+
+**Chiến lược extract frames:**
+- Video < 30s: 5 frames (0%, 25%, 50%, 75%, 90%)
+- Video 30s-2 phút: 10 frames (phân bố đều)
+- Video > 2 phút: 15 frames (phân bố đều)
+- Tất cả frames được ghép thành 1 thumbnail grid → 1 embedding vector
 
 **Tham số:**
 - `--input`: File CSV chứa URLs
@@ -449,14 +458,69 @@ python clean_empty_jobs.py --root batch_outputs
 **Chức năng:**
 - Đọc URLs từ CSV
 - Download video hoặc mở trực tiếp từ URL
-- Extract frame đầu tiên
-- Tạo CLIP embedding (512 dims, L2-normalized)
+- Extract frames đều đặn từ video (5-15 frames tùy độ dài)
+- Ghép các frames thành thumbnail grid (1 ảnh lớn)
+- Tạo CLIP embedding từ thumbnail grid (512 dims, L2-normalized)
 - Upload lên Zilliz với batch size tự động
 
 **Ưu điểm:**
 - Không cần lưu video local (tiết kiệm disk)
 - Xử lý song song với batch
 - Tự động retry khi lỗi
+- **Độ chính xác cao hơn**: Sử dụng nhiều frames thay vì chỉ frame đầu, giúp nhận diện tốt hơn các video trùng lặp dù có intro/logo khác nhau
+
+---
+
+### 5b. `batch_extract_from_urls.py` (Alternative)
+
+**Mục đích:** Extract embeddings từ video và lưu local (sau đó upload bằng `upload_aggregated_to_milvus.py`)
+
+**Input:** CSV file với URLs
+
+**Chức năng:**
+- Đọc URLs từ CSV
+- Extract frames đều đặn từ video (5-15 frames tùy độ dài) hoặc chỉ frame đầu (fast mode)
+- Ghép các frames thành thumbnail grid (nếu dùng distributed mode)
+- Tạo CLIP embedding và lưu vào file `.npy` trong folder `batch_outputs/url_XXXX/`
+
+**Tham số:**
+- `--num_frames 1`: Fast mode - chỉ lấy frame đầu tiên
+- `--num_frames 3` (hoặc > 1): Distributed mode - lấy 5-15 frames và ghép thành thumbnail grid
+
+**Output:** 
+- Folder `batch_outputs/url_XXXX/` chứa:
+  - `thumbnail_embedding.npy`: Embedding từ thumbnail grid (nếu dùng distributed mode)
+  - `first_frame.npy`: Embedding từ frame đầu (nếu dùng fast mode)
+  - `url.txt`: URL gốc
+
+**Ưu điểm:**
+- Có thể xử lý offline và upload sau
+- Hỗ trợ cả 2 mode: fast (1 frame) và distributed (thumbnail grid)
+- Có thể xử lý từng chunk với `--start` và `--end`
+
+---
+
+### 5c. `upload_aggregated_to_milvus.py`
+
+**Mục đích:** Upload embeddings từ local folders (`batch_outputs/`) lên Milvus/Zilliz
+
+**Input:** Folder `batch_outputs/` chứa các folder `url_XXXX/` với file `.npy`
+
+**Chức năng:**
+- Đọc embeddings từ các folder `batch_outputs/url_XXXX/`
+- Hỗ trợ cả 2 format: `thumbnail_embedding.npy` (mới) và `first_frame.npy` (cũ, backward compatible)
+- Upload lên Milvus/Zilliz với batch size tự động
+
+**Tham số:**
+- `--root`: Root directory chứa các job folders (default: `batch_outputs`)
+- `--collection`: Tên collection trong Milvus/Zilliz
+- `--overwrite`: Cho phép overwrite collection đã có
+
+**Output:** Embeddings được upload lên Milvus/Zilliz collection
+
+**Lưu ý:** 
+- Script tự động detect format: ưu tiên `thumbnail_embedding.npy`, fallback về `first_frame.npy`
+- Dùng sau khi chạy `batch_extract_from_urls.py` để upload embeddings đã extract
 
 ---
 
@@ -496,6 +560,7 @@ python clean_empty_jobs.py --root batch_outputs
 **Tính năng đặc biệt:**
 - ✅ Xử lý khác độ phân giải: Tự động chọn video có resolution cao nhất
 - ✅ Xử lý khung hình to nhỏ: Dùng embeddings, không phụ thuộc pixel size
+- ✅ **Thumbnail grid embeddings**: Sử dụng embeddings từ thumbnail grid (nhiều frames) giúp nhận diện tốt hơn các video trùng lặp dù có intro/logo khác nhau
 - ✅ Pre-filtering thông minh: Loại bỏ cùng video với signature/itag khác
 - ✅ Cross-chunk detection: Phát hiện duplicates giữa chunks
 - ✅ Path validation: Tránh transitive closure (A-B, B-C không có nghĩa A-C)
@@ -733,6 +798,10 @@ python clean_empty_jobs.py --root batch_outputs
 ## 📝 Notes
 
 - **Embeddings**: Sử dụng CLIP model (`openai/clip-vit-base-patch32`) với 512 dimensions
+- **Frame extraction**: 
+  - **Distributed sampling**: Lấy 5-15 frames đều đặn trong video (tùy độ dài)
+  - **Thumbnail grid**: Ghép các frames thành 1 ảnh lớn (grid layout)
+  - **1 embedding vector**: Từ thumbnail grid (thay vì nhiều vectors từ nhiều frames)
 - **Similarity metric**: Inner Product (IP) với L2-normalized vectors
 - **Resolution detection**: Tự động extract từ itag (Google CDN) hoặc URL pattern
 - **Job ID format**: `url_XXXX` với XXXX là số (4 digits với leading zeros)

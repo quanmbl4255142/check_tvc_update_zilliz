@@ -5,6 +5,7 @@ Extract embeddings on-the-fly and upload immediately (no persistent storage)
 
 import argparse
 import csv
+import math
 import os
 import sys
 import tempfile
@@ -295,13 +296,161 @@ def download_video(url: str, dest_path: str, max_retries: int = 3, timeout: int 
         raise RuntimeError(error_msg)
 
 
-def extract_first_frame_embedding(url: str, verbose: bool = False) -> tuple[Optional[np.ndarray], Optional[str]]:
+def get_video_duration(cap: cv2.VideoCapture) -> float:
+    """Get video duration in seconds"""
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        if fps > 0 and frame_count > 0:
+            return frame_count / fps
+    except Exception:
+        pass
+    return 0.0
+
+
+def extract_frame_at_position(cap: cv2.VideoCapture, position: float) -> Optional[Image.Image]:
+    """Extract a single frame at given position (0.0 = start, 0.5 = middle, 0.9 = near end)"""
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if total_frames <= 0 or fps <= 0:
+            return None
+        
+        target_frame = int(total_frames * position)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        success, frame = cap.read()
+        
+        if success and frame is not None:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(rgb)
+    except Exception:
+        pass
+    return None
+
+
+def calculate_frame_positions(duration_seconds: float) -> List[float]:
     """
-    Extract first frame from video URL and return embedding
+    Calculate frame positions (0.0-1.0) to extract based on video duration.
+    
+    Strategy:
+    - Video < 30s: 5 frames (0%, 25%, 50%, 75%, 90%)
+    - Video 30s-2min: 10 frames (distributed evenly, avoid 100% to skip credits)
+    - Video > 2min: 15 frames (distributed evenly, avoid 100%)
+    """
+    if duration_seconds < 30:
+        # 5 frames: 0%, 25%, 50%, 75%, 90%
+        return [0.0, 0.25, 0.5, 0.75, 0.9]
+    elif duration_seconds < 120:  # 2 minutes
+        # 10 frames: distributed evenly (0% to 90%)
+        num_frames = 10
+        return [i / (num_frames - 1) * 0.9 for i in range(num_frames)]
+    else:
+        # 15 frames: distributed evenly (0% to 90%)
+        num_frames = 15
+        return [i / (num_frames - 1) * 0.9 for i in range(num_frames)]
+
+
+def extract_frames_distributed(cap: cv2.VideoCapture) -> List[Image.Image]:
+    """
+    Extract frames distributed evenly across video duration.
+    Returns list of PIL Images.
+    """
+    frames = []
+    duration = get_video_duration(cap)
+    if duration <= 0:
+        # Fallback: try to get first frame
+        cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+        success, frame = cap.read()
+        if success and frame is not None:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(Image.fromarray(rgb))
+        return frames
+    
+    positions = calculate_frame_positions(duration)
+    for pos in positions:
+        img = extract_frame_at_position(cap, pos)
+        if img:
+            frames.append(img)
+    
+    return frames
+
+
+def create_thumbnail_grid(frames: List[Image.Image], target_size: int = 224) -> Image.Image:
+    """
+    Create a grid thumbnail from multiple frames.
+    
+    Args:
+        frames: List of PIL Images
+        target_size: Size to resize each frame before arranging (default: 224)
+    
+    Returns:
+        Combined thumbnail as PIL Image
+    """
+    if not frames:
+        # Return a blank image if no frames
+        return Image.new('RGB', (target_size, target_size), color='black')
+    
+    if len(frames) == 1:
+        # Single frame: just resize
+        return frames[0].resize((target_size, target_size), Image.Resampling.LANCZOS)
+    
+    # Calculate grid dimensions
+    num_frames = len(frames)
+    if num_frames <= 4:
+        cols = 2
+        rows = 2
+    elif num_frames <= 9:
+        cols = 3
+        rows = 3
+    elif num_frames <= 16:
+        cols = 4
+        rows = 4
+    else:
+        # For 15 frames: 4x4 grid (last cell empty)
+        cols = 4
+        rows = 4
+    
+    # Resize all frames to target_size
+    resized_frames = []
+    for frame in frames:
+        # Resize maintaining aspect ratio, then crop to square
+        frame.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
+        # Create square image with black padding if needed
+        square = Image.new('RGB', (target_size, target_size), color='black')
+        # Center the frame
+        x_offset = (target_size - frame.width) // 2
+        y_offset = (target_size - frame.height) // 2
+        square.paste(frame, (x_offset, y_offset))
+        resized_frames.append(square)
+    
+    # Create grid
+    grid_width = cols * target_size
+    grid_height = rows * target_size
+    grid = Image.new('RGB', (grid_width, grid_height), color='black')
+    
+    # Paste frames into grid
+    for idx, frame in enumerate(resized_frames):
+        if idx >= cols * rows:
+            break
+        row = idx // cols
+        col = idx % cols
+        x = col * target_size
+        y = row * target_size
+        grid.paste(frame, (x, y))
+    
+    return grid
+
+
+def extract_first_frame_embedding(url: str, verbose: bool = False, use_thumbnail: bool = True) -> tuple[Optional[np.ndarray], Optional[str]]:
+    """
+    Extract embedding from video URL.
+    If use_thumbnail=True: extract distributed frames, create thumbnail grid, and embed (better accuracy)
+    If use_thumbnail=False: extract only first frame (faster but less accurate)
     
     Args:
         url: Video URL
         verbose: If True, return error message along with None
+        use_thumbnail: If True, use distributed frames + thumbnail grid (default: True)
     
     Returns:
         (embedding, error_message) - embedding is None if failed, error_message is None if success
@@ -447,48 +596,81 @@ def extract_first_frame_embedding(url: str, verbose: bool = False) -> tuple[Opti
                     return (None, "; ".join(error_messages))
                 return (None, error_msg)
             
-            cap.set(cv2.CAP_PROP_POS_MSEC, 0)
-            success, frame = cap.read()
-            
-            if success and frame is not None:
-                if frame.size == 0:
-                    error_msg = "Frame from downloaded video is empty"
-                    error_messages.append(error_msg)
-                    cap.release()
-                    if verbose:
-                        return (None, "; ".join(error_messages))
-                    return (None, error_msg)
-                
-                temp_img_path = os.path.join(tdir, "frame.png")
-                temp_npy_path = os.path.join(tdir, "embedding.npy")
-                
+            if use_thumbnail:
+                # New mode: extract distributed frames, create thumbnail grid, embed
                 try:
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    img = Image.fromarray(rgb)
-                    img.save(temp_img_path)
+                    frames = extract_frames_distributed(cap)
+                    cap.release()
                     
-                    # Create embedding
-                    embed_image_clip_to_npy(temp_img_path, temp_npy_path, model_id="openai/clip-vit-base-patch32")
-                    
-                    # Load and normalize
-                    vec = np.load(temp_npy_path).astype(np.float32).flatten()
-                    norm = np.linalg.norm(vec)
-                    if norm > 0:
-                        vec = vec / norm
-                        cap.release()
-                        return (vec, None)
+                    if frames:
+                        # Create thumbnail grid from frames
+                        thumbnail = create_thumbnail_grid(frames, target_size=224)
+                        temp_img_path = os.path.join(tdir, "thumbnail.png")
+                        temp_npy_path = os.path.join(tdir, "embedding.npy")
+                        thumbnail.save(temp_img_path)
+                        
+                        # Create embedding from thumbnail
+                        embed_image_clip_to_npy(temp_img_path, temp_npy_path, model_id="openai/clip-vit-base-patch32")
+                        
+                        # Load and normalize
+                        vec = np.load(temp_npy_path).astype(np.float32).flatten()
+                        norm = np.linalg.norm(vec)
+                        if norm > 0:
+                            vec = vec / norm
+                            return (vec, None)
+                        else:
+                            error_msg = "Embedding norm is zero"
+                            error_messages.append(error_msg)
                     else:
-                        error_msg = "Embedding norm is zero"
+                        error_msg = "No frames extracted from video"
                         error_messages.append(error_msg)
                 except Exception as e:
-                    error_msg = f"Embedding creation failed: {str(e)}"
+                    error_msg = f"Thumbnail extraction/embedding failed: {str(e)}"
                     error_messages.append(error_msg)
-                
-                cap.release()
             else:
-                error_msg = "Failed to read frame from downloaded video"
-                error_messages.append(error_msg)
-                cap.release()
+                # Old mode: only first frame (faster)
+                cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+                success, frame = cap.read()
+                
+                if success and frame is not None:
+                    if frame.size == 0:
+                        error_msg = "Frame from downloaded video is empty"
+                        error_messages.append(error_msg)
+                        cap.release()
+                        if verbose:
+                            return (None, "; ".join(error_messages))
+                        return (None, error_msg)
+                    
+                    temp_img_path = os.path.join(tdir, "frame.png")
+                    temp_npy_path = os.path.join(tdir, "embedding.npy")
+                    
+                    try:
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        img = Image.fromarray(rgb)
+                        img.save(temp_img_path)
+                        
+                        # Create embedding
+                        embed_image_clip_to_npy(temp_img_path, temp_npy_path, model_id="openai/clip-vit-base-patch32")
+                        
+                        # Load and normalize
+                        vec = np.load(temp_npy_path).astype(np.float32).flatten()
+                        norm = np.linalg.norm(vec)
+                        if norm > 0:
+                            vec = vec / norm
+                            cap.release()
+                            return (vec, None)
+                        else:
+                            error_msg = "Embedding norm is zero"
+                            error_messages.append(error_msg)
+                    except Exception as e:
+                        error_msg = f"Embedding creation failed: {str(e)}"
+                        error_messages.append(error_msg)
+                    
+                    cap.release()
+                else:
+                    error_msg = "Failed to read frame from downloaded video"
+                    error_messages.append(error_msg)
+                    cap.release()
                 
         except Exception as e:
             error_msg = f"Frame extraction error: {str(e)}"
@@ -533,13 +715,13 @@ def create_collection_if_not_exists(collection_name: str) -> Collection:
             name="embedding",
             dtype=DataType.FLOAT_VECTOR,
             dim=EMBEDDING_DIM,
-            description="CLIP embedding from first frame"
+            description="CLIP embedding from thumbnail grid (distributed frames)"
         ),
     ]
     
     schema = CollectionSchema(
         fields,
-        description="Video embeddings (1 vector per video, direct upload)"
+        description="Video embeddings (1 vector per video, thumbnail grid from distributed frames)"
     )
     
     collection = Collection(
