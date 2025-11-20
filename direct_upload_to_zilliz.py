@@ -11,8 +11,21 @@ import tempfile
 import time
 import logging
 from typing import Optional, List
+from contextlib import redirect_stderr
+from io import StringIO
 
-import cv2
+# Suppress OpenCV warnings/errors (set before importing cv2)
+# OPENCV_LOG_LEVEL: 0=VERBOSE, 1=DEBUG, 2=INFO, 3=WARN, 4=ERROR, 5=FATAL, 6=SILENT
+os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'  # Chỉ hiển thị ERROR, không hiển thị WARN
+# Backup: Set cv2 log level nếu OPENCV_LOG_LEVEL không hoạt động
+try:
+    import cv2
+    # Set log level to ERROR (chỉ hiển thị errors, không hiển thị warnings)
+    # Note: Có thể không hoạt động với mọi version OpenCV
+    if hasattr(cv2, 'setLogLevel'):
+        cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
+except:
+    import cv2
 import numpy as np
 from PIL import Image
 from pymilvus import (
@@ -337,65 +350,60 @@ def extract_first_frame_embedding(url: str, verbose: bool = False) -> tuple[Opti
     with tempfile.TemporaryDirectory() as tdir:
         # METHOD 1: Try opening directly from URL
         # Suppress OpenCV warnings (như "Could not find decoder for codec_id=61")
-        # vì chúng ta sẽ fallback sang download method nếu OpenCV fail
-        import warnings
-        import sys
-        from io import StringIO
-        
+        # bằng cách redirect stderr khi gọi VideoCapture
         try:
-            # Tạm thời redirect stderr để suppress OpenCV warnings
+            # Redirect stderr để suppress OpenCV warnings khi khởi tạo VideoCapture
+            # OpenCV in warnings ra stderr ngay khi gọi VideoCapture()
             old_stderr = sys.stderr
             sys.stderr = StringIO()
-            
             try:
                 cap = cv2.VideoCapture(url)
-                if cap.isOpened():
-                    # Set timeout for reading (some URLs hang)
-                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 30000)  # 30 seconds
-                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 30000)  # 30 seconds
-                    
-                    cap.set(cv2.CAP_PROP_POS_MSEC, 0)
-                    success, frame = cap.read()
-                    
-                    if success and frame is not None:
-                        # Check if frame is valid
-                        if frame.size == 0:
-                            error_messages.append("Frame is empty")
-                            cap.release()
-                        else:
-                            temp_img_path = os.path.join(tdir, "frame.png")
-                            temp_npy_path = os.path.join(tdir, "embedding.npy")
-                            
-                            try:
-                                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                img = Image.fromarray(rgb)
-                                img.save(temp_img_path)
-                                
-                                # Create embedding
-                                embed_image_clip_to_npy(temp_img_path, temp_npy_path, model_id="openai/clip-vit-base-patch32")
-                                
-                                # Load and normalize
-                                vec = np.load(temp_npy_path).astype(np.float32).flatten()
-                                norm = np.linalg.norm(vec)
-                                if norm > 0:
-                                    vec = vec / norm
-                                    cap.release()
-                                    sys.stderr = old_stderr  # Restore stderr
-                                    return (vec, None)
-                                else:
-                                    error_messages.append("Embedding norm is zero")
-                            except Exception as e:
-                                error_messages.append(f"Embedding creation failed: {str(e)}")
-                            
-                            cap.release()
+            finally:
+                sys.stderr = old_stderr  # Restore ngay sau khi khởi tạo
+            
+            if cap.isOpened():
+                # Set timeout for reading (some URLs hang)
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 30000)  # 30 seconds
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 30000)  # 30 seconds
+                
+                cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+                success, frame = cap.read()
+                
+                if success and frame is not None:
+                    # Check if frame is valid
+                    if frame.size == 0:
+                        error_messages.append("Frame is empty")
+                        cap.release()
                     else:
-                        error_messages.append("Failed to read frame from URL (direct access - may be HEVC codec)")
+                        temp_img_path = os.path.join(tdir, "frame.png")
+                        temp_npy_path = os.path.join(tdir, "embedding.npy")
+                        
+                        try:
+                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            img = Image.fromarray(rgb)
+                            img.save(temp_img_path)
+                            
+                            # Create embedding
+                            embed_image_clip_to_npy(temp_img_path, temp_npy_path, model_id="openai/clip-vit-base-patch32")
+                            
+                            # Load and normalize
+                            vec = np.load(temp_npy_path).astype(np.float32).flatten()
+                            norm = np.linalg.norm(vec)
+                            if norm > 0:
+                                vec = vec / norm
+                                cap.release()
+                                return (vec, None)
+                            else:
+                                error_messages.append("Embedding norm is zero")
+                        except Exception as e:
+                            error_messages.append(f"Embedding creation failed: {str(e)}")
+                        
                         cap.release()
                 else:
-                    error_messages.append("Failed to open URL with OpenCV (direct access - may be unsupported codec)")
-            finally:
-                # Restore stderr
-                sys.stderr = old_stderr
+                    error_messages.append("Failed to read frame from URL (direct access - may be HEVC codec)")
+                    cap.release()
+            else:
+                error_messages.append("Failed to open URL with OpenCV (direct access - may be unsupported codec)")
                 
         except cv2.error as e:
             error_messages.append(f"OpenCV error (direct access): {str(e)}")
@@ -420,8 +428,16 @@ def extract_first_frame_embedding(url: str, verbose: bool = False) -> tuple[Opti
             return (None, error_msg)
         
         # Extract frame from downloaded video
+        # Suppress OpenCV warnings khi mở file đã download
         try:
-            cap = cv2.VideoCapture(tmp_video_path)
+            # Redirect stderr để suppress OpenCV warnings
+            old_stderr = sys.stderr
+            sys.stderr = StringIO()
+            try:
+                cap = cv2.VideoCapture(tmp_video_path)
+            finally:
+                sys.stderr = old_stderr  # Restore ngay sau khi khởi tạo
+            
             if not cap.isOpened():
                 error_msg = "Failed to open downloaded video file"
                 error_messages.append(error_msg)
