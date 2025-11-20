@@ -21,6 +21,7 @@ from threading import Lock
 import psutil
 from tqdm import tqdm
 
+# pymilvus dùng để kết nối với zilliz và milvus
 from pymilvus import (
     connections,
     Collection,

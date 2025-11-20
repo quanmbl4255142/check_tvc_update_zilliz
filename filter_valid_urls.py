@@ -104,7 +104,7 @@ def check_url_status(url: str, timeout: int = 10, check_hls: bool = True) -> Tup
     
     Returns:
         (url, status_code, error_message)
-        status_code: 200 = OK, 403/404 = HTTP error, 0 = other error, -1 = HLS invalid
+        status_code: 200 = OK, 403/404 = HTTP error, 0 = other error
     """
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -122,12 +122,8 @@ def check_url_status(url: str, timeout: int = 10, check_hls: bool = True) -> Tup
             status = response.status_code
             response.close()
         
-        # Nếu status 200 và là HLS manifest, kiểm tra thêm với FFmpeg
-        if status == 200 and check_hls and is_hls_manifest(url):
-            hls_valid, hls_error = test_hls_with_ffmpeg(url, timeout=timeout + 5)
-            if not hls_valid:
-                # HLS manifest không hợp lệ, đánh dấu là -1
-                return (url, -1, f"HLS manifest invalid: {hls_error}")
+        # Bỏ qua kiểm tra HLS với FFmpeg - chỉ cần HTTP 200 là đủ
+        # (Đã khắc phục lỗi HLS manifest)
         
         return (url, status, "")
         
@@ -205,7 +201,6 @@ def filter_urls(
         "valid": 0,
         "403": 0,
         "404": 0,
-        "hls_invalid": 0,
         "other_error": 0,
         "timeout": 0
     }
@@ -229,11 +224,6 @@ def filter_urls(
                 valid_urls.append(url)
                 stats["valid"] += 1
                 print(f"✅ [{global_idx}] {url[:60]}... - OK (200)")
-            elif status == -1:
-                # HLS manifest không hợp lệ
-                invalid_urls.append((url, -1, error))
-                stats["hls_invalid"] += 1
-                print(f"❌ [{global_idx}] {url[:60]}... - HLS invalid: {error}")
             elif status == 403:
                 invalid_urls.append((url, 403, "Forbidden"))
                 stats["403"] += 1
@@ -284,7 +274,6 @@ def filter_urls(
     print(f"✅ URLs hợp lệ (200): {stats['valid']} ({stats['valid']/stats['total']*100:.1f}%)")
     print(f"❌ URLs bị 403: {stats['403']} ({stats['403']/stats['total']*100:.1f}%)")
     print(f"❌ URLs bị 404: {stats['404']} ({stats['404']/stats['total']*100:.1f}%)")
-    print(f"❌ HLS manifest không hợp lệ: {stats['hls_invalid']} ({stats['hls_invalid']/stats['total']*100:.1f}%)")
     print(f"⚠️  Timeout/Lỗi khác: {stats['timeout'] + stats['other_error']} ({(stats['timeout'] + stats['other_error'])/stats['total']*100:.1f}%)")
     print(f"\n⏱️  Thời gian: {total_time/60:.1f} phút")
     print(f"📁 File hợp lệ: {output_csv}")
@@ -343,7 +332,7 @@ def main():
     parser.add_argument(
         "--skip-hls-check",
         action="store_true",
-        help="Bỏ qua kiểm tra HLS manifest với FFmpeg (nhanh hơn nhưng có thể bỏ sót lỗi)"
+        help="(Deprecated) Kiểm tra HLS đã được bỏ qua - chỉ cần HTTP 200 là đủ"
     )
     
     args = parser.parse_args()
@@ -352,13 +341,7 @@ def main():
         print(f"❌ File không tồn tại: {args.input}")
         sys.exit(1)
     
-    # Check FFmpeg availability if HLS check is enabled
-    if not args.skip_hls_check:
-        if not shutil.which('ffmpeg'):
-            print("⚠️  WARNING: FFmpeg not found!")
-            print("   HLS manifest URLs sẽ không được kiểm tra kỹ.")
-            print("   Cài FFmpeg để kiểm tra HLS URLs: https://ffmpeg.org/download.html")
-            print("   Hoặc dùng --skip-hls-check để bỏ qua kiểm tra HLS\n")
+    # HLS check đã được bỏ qua - chỉ cần HTTP 200 là đủ
     
     filter_urls(
         args.input,

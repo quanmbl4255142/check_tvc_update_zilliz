@@ -16,3 +16,5 @@ batch_outputs/
 .DS_Store
 .env
 *.npy
+search_duplicates_aggregated1.py
+url-tvc.invalid.csv

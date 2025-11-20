@@ -77,7 +77,9 @@ INDEX_TYPE = os.getenv("MILVUS_INDEX_TYPE", "IVF_FLAT")
 METRIC_TYPE = os.getenv("MILVUS_METRIC_TYPE", "IP")
 
 # Index parameters based on index type
-if INDEX_TYPE == "IVF_FLAT":
+# INDEX_TYPE ở đây nghĩa là kiểu chỉ mục được sử dụng trong Milvus để tối ưu hóa việc tìm kiếm vector.
+# Nếu là "IVF_FLAT", nó sử dụng phương pháp phân vùng để tăng tốc độ tìm kiếm.
+if INDEX_TYPE == "IVF_FLAT": 
     INDEX_PARAMS = {
         "metric_type": METRIC_TYPE,
         "index_type": INDEX_TYPE,
@@ -91,6 +93,8 @@ if INDEX_TYPE == "IVF_FLAT":
             "nprobe": 16  # Number of clusters to search (higher = more accurate but slower)
         }
     }
+    
+# Index dạng đồ thị — tốc độ cực nhanh, chính xác cao.
 elif INDEX_TYPE == "HNSW":
     INDEX_PARAMS = {
         "metric_type": METRIC_TYPE,
@@ -106,6 +110,8 @@ elif INDEX_TYPE == "HNSW":
             "ef": 64  # Search quality (higher = more accurate but slower)
         }
     }
+    
+# Dùng Product Quantization → tiết kiệm không gian lưu trữ, phù hợp dữ liệu rất lớn.
 elif INDEX_TYPE == "IVF_PQ":
     INDEX_PARAMS = {
         "metric_type": METRIC_TYPE,
