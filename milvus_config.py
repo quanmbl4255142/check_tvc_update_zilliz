@@ -87,6 +87,7 @@ if INDEX_TYPE == "IVF_FLAT":
             "nlist": 1024  # Number of cluster units (1024 good for 10k-100k vectors)
         }
     }
+    
     SEARCH_PARAMS = {
         "metric_type": METRIC_TYPE,
         "params": {
