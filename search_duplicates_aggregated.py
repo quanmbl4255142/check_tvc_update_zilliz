@@ -51,7 +51,7 @@ class PerformanceTracker:
         self.phase_start = None # thời gian bắt đầu của pha hiện tại
         self.current_phase = None # tên của pha(bước hiện tại)hiện tại
         self.initial_ram_mb = self.process.memory_info().rss / 1024 / 1024 # RAM ban đầu
-        self.peak_ram_mb = self.initial_ram_mb # RAM peak(cực đại) nghĩa là 
+        self.peak_ram_mb = self.initial_ram_mb # RAM peak(cực đại) nghĩa là lượng RAM tối đa được sử dụng trong quá trình chạy chương trình
         self.cpu_samples = [] # mảng chứa các mẫu CPU samples(các giá trị CPU tại các thời điểm khác nhau)
     
     # start_phase là hàm để bắt đầu track một bước cụ thể của chương trình
@@ -64,10 +64,10 @@ class PerformanceTracker:
     def end_phase(self):
         """End current phase and record time"""
         if self.phase_start and self.current_phase:
-            elapsed = time.time() - self.phase_start
-            self.phase_times[self.current_phase] = elapsed
-            self.current_phase = None
-            self.phase_start = None
+            elapsed = time.time() - self.phase_start #được tính bằng cách lấy thời gian hiện tại trừ đi thời gian bắt đầu của pha hiện tại
+            self.phase_times[self.current_phase] = elapsed #lưu thời gian thực hiện của pha hiện tại vào dict phase_times
+            self.current_phase = None #đặt pha hiện tại về None
+            self.phase_start = None #đặt thời gian bắt đầu của pha hiện tại về None
             
     def update_stats(self):
         """Update RAM and CPU stats"""
