@@ -25,16 +25,16 @@ flowchart TD
     QueryChunk --> LoadData[📥 Load embeddings + URLs<br/>all_data = job_id, url, embedding]
     QueryAll --> LoadData
     
-    LoadData --> BuildVideoInfo[🔧 Xây dựng video_info map<br/>job_id → url, embedding]
+    LoadData --> BuildVideoInfo["🔧 Xây dựng video_info map<br/>job_id to url, embedding"]
     
-    BuildVideoInfo --> CheckSkipURL{--skip_url_dedup?}
+    BuildVideoInfo --> CheckSkipURL{"--skip_url_dedup?"}
     
     CheckSkipURL -->|Có| SkipPreFilter[⏭️ Bỏ qua Pre-filtering<br/>Giữ tất cả videos]
     CheckSkipURL -->|Không| PreFilter[🔍 PRE-FILTERING]
     
     PreFilter --> ExtractVideoID[📋 Extract Video ID từ URL<br/>✨ 8 CDN được hỗ trợ:<br/>- Google CDN, YouTube<br/>- FlashTalking, FPT Play<br/>- Adnxs, VZ CDN<br/>- UpPremium, BlueAdss<br/>- Adsrvr, AIActiv]
     
-    ExtractVideoID --> GroupByID[📊 Nhóm videos theo Video ID<br/>video_id_groups: video_id → [job_ids]]
+    ExtractVideoID --> GroupByID["📊 Nhóm videos theo Video ID<br/>video_id_groups: video_id to list of job_ids"]
     
     GroupByID --> CheckChunkMode{Chunk Mode?}
     
@@ -50,9 +50,9 @@ flowchart TD
     
     SelectBest --> ExtractResolution[📐 Extract Resolution từ URL<br/>✨ Hỗ trợ nhiều patterns:<br/>- FlashTalking: _width_height_bitrate_fps<br/>- Adnxs: _width_height_bitratek<br/>- VZ CDN: play_1080p<br/>- Query params: ?width=1920&height=1080]
     
-    ExtractResolution --> CalculateScore[📊 Tính resolution_score<br/>score = width × height<br/>Hoặc itag nếu không có resolution]
+    ExtractResolution --> CalculateScore["📊 Tính resolution_score<br/>score = width x height<br/>Hoặc itag nếu không có resolution"]
     
-    CalculateScore --> SortByQuality[🔢 Sort videos:<br/>1. resolution_score DESC<br/>2. itag DESC<br/>3. job_id ASC]
+    CalculateScore --> SortByQuality["🔢 Sort videos:<br/>1. resolution_score DESC<br/>2. itag DESC<br/>3. job_id ASC"]
     
     SortByQuality --> SelectBestQuality[✅ Chọn video có resolution cao nhất<br/>Giữ lại trong group]
     
@@ -67,32 +67,32 @@ flowchart TD
     
     ParallelSearch --> CollectPairs[📋 Thu thập duplicate pairs<br/>job_id1, job_id2, similarity<br/>Thread-safe collection]
     
-    CollectPairs --> FilterThreshold[✅ Lọc pairs:<br/>similarity >= threshold<br/>Validate score: 0.0 <= score <= 1.0]
+    CollectPairs --> FilterThreshold["✅ Lọc pairs:<br/>similarity >= threshold<br/>Validate score: 0.0 to 1.0"]
     
-    FilterThreshold --> NormalizePairs[🔄 Normalize pairs<br/>Sort job_ids để tránh trùng<br/>Remove duplicate pairs]
+    FilterThreshold --> NormalizePairs["🔄 Normalize pairs<br/>Sort job_ids để tránh trùng<br/>Remove duplicate pairs"]
     
-    NormalizePairs --> SeparatePairs[📊 Tách pairs:<br/>- within-chunk pairs<br/>- cross-chunk pairs]
+    NormalizePairs --> SeparatePairs["📊 Tách pairs:<br/>- within-chunk pairs<br/>- cross-chunk pairs"]
     
     SeparatePairs --> Pass2[🔗 PASS 2: Clustering & Chọn Originals]
     
     Pass2 --> ProcessCrossChunk[🌐 Xử lý Cross-chunk Duplicates]
     
-    ProcessCrossChunk --> CheckCrossThreshold{similarity >=<br/>cross_chunk_threshold?<br/>default: 0.98}
+    ProcessCrossChunk --> CheckCrossThreshold{"similarity >=<br/>cross_chunk_threshold?<br/>default: 0.98"}
     
-    CheckCrossThreshold -->|Có| CheckOriginal{Original ở<br/>chunk khác?}
+    CheckCrossThreshold -->|Có| CheckOriginal{"Original ở<br/>chunk khác?"}
     CheckCrossThreshold -->|Không| SkipCrossDup[⏭️ Bỏ qua pair này<br/>Similarity quá thấp]
     
     CheckOriginal -->|Có| MarkCrossDup[🏷️ Đánh dấu duplicate<br/>nếu original ở chunk khác<br/>Thêm vào cross_chunk_duplicates]
     CheckOriginal -->|Không| SkipCrossDup
     
     MarkCrossDup --> BuildGraph
-    SkipCrossDup --> BuildGraph[🕸️ Xây dựng Graph<br/>job_id → neighbors<br/>Chỉ within-chunk pairs]
+    SkipCrossDup --> BuildGraph["🕸️ Xây dựng Graph<br/>job_id to neighbors<br/>Chỉ within-chunk pairs"]
     
-    BuildGraph --> BuildSimilarityDict[📚 Xây dựng similarity lookup<br/>job_id1, job_id2 → similarity<br/>Dict để tối ưu lookup]
+    BuildGraph --> BuildSimilarityDict["📚 Xây dựng similarity lookup<br/>job_id1, job_id2 to similarity<br/>Dict để tối ưu lookup"]
     
-    BuildSimilarityDict --> DFS[🔍 DFS với Path Validation<br/>Max path length = 2<br/>Path similarity >= threshold × 0.95<br/>Tránh transitive closure]
+    BuildSimilarityDict --> DFS["🔍 DFS với Path Validation<br/>Max path length = 2<br/>Path similarity >= threshold x 0.95<br/>Tránh transitive closure"]
     
-    DFS --> FindClusters[📊 Tìm Connected Components<br/>Mỗi cluster = 1 nhóm duplicates<br/>Iterative DFS để tránh recursion limit]
+    DFS --> FindClusters["📊 Tìm Connected Components<br/>Mỗi cluster = 1 nhóm duplicates<br/>Iterative DFS để tránh recursion limit"]
     
     FindClusters --> ProcessClusters[🔄 Xử lý từng Cluster]
     
@@ -104,19 +104,19 @@ flowchart TD
     
     SelectOriginal --> AddDuplicates[📝 Thêm duplicates vào<br/>duplicates list<br/>Với similarity từ lookup dict]
     
-    AddDuplicates --> CheckStandalone{Còn videos<br/>standalone?<br/>Không trong cluster}
+    AddDuplicates --> CheckStandalone{"Còn videos<br/>standalone?<br/>Không trong cluster"}
     
     CheckStandalone -->|Có| AddStandalone[➕ Thêm standalone videos<br/>vào unique_videos<br/>Không có duplicates]
     CheckStandalone -->|Không| AddCrossDup
     
-    AddStandalone --> AddCrossDup[🌐 Thêm cross-chunk duplicates<br/>vào duplicates list<br/>Mark [CROSS-CHUNK] trong original_url]
+    AddStandalone --> AddCrossDup["🌐 Thêm cross-chunk duplicates<br/>vào duplicates list<br/>Mark CROSS-CHUNK trong original_url"]
     
-    AddCrossDup --> CheckAutoClean{--auto_clean?}
+    AddCrossDup --> CheckAutoClean{"--auto_clean?"}
     
-    CheckAutoClean -->|Có| ValidateURL[🧼 Kiểm tra URL hợp lệ<br/>Loại bỏ PNG/images<br/>Loại bỏ URLs lỗi<br/>Kiểm tra domain, extension]
+    CheckAutoClean -->|Có| ValidateURL["🧼 Kiểm tra URL hợp lệ<br/>Loại bỏ PNG/images<br/>Loại bỏ URLs lỗi<br/>Kiểm tra domain, extension"]
     CheckAutoClean -->|Không| WriteResults
     
-    ValidateURL --> SeparateValid[📊 Tách valid/invalid URLs<br/>valid_videos vs invalid_urls]
+    ValidateURL --> SeparateValid["📊 Tách valid/invalid URLs<br/>valid_videos vs invalid_urls"]
     
     SeparateValid --> WriteResults[💾 Ghi kết quả]
     
@@ -234,7 +234,7 @@ flowchart TD
         D2{⏭️ --skip_url_dedup?}
         D3{🔗 Video ID exists<br/>in other chunk<br/>with smaller job_id?}
         D4{🌐 similarity >=<br/>cross_chunk_threshold?<br/>default: 0.98}
-        D5{🔍 Path similarity >=<br/>threshold × 0.95?<br/>Max path length = 2}
+        D5{"🔍 Path similarity >=<br/>threshold x 0.95?<br/>Max path length = 2"}
         D6{🧼 --auto_clean?}
         D7{✅ URL valid?<br/>Not PNG/image<br/>Has video indicator}
         D8{📊 Video in cluster?}
@@ -278,14 +278,14 @@ flowchart LR
     
     subgraph Processing["⚙️ PROCESSING"]
         P1[all_data:<br/>List of {job_id, url, embedding}]
-        P2[video_info:<br/>Dict: job_id → {url, embedding}]
-        P3[video_id_groups:<br/>Dict: video_id → [job_ids]]
-        P4[duplicate_pairs:<br/>List of (job_id1, job_id2, similarity)]
-        P5[chunk_duplicate_pairs:<br/>Within-chunk pairs]
-        P6[cross_chunk_pairs:<br/>Cross-chunk pairs]
-        P7[similarity_lookup:<br/>Dict: (job_id1, job_id2) → similarity]
-        P8[graph:<br/>Dict: job_id → Set[neighbors]]
-        P9[clusters:<br/>List of Set[job_ids]]
+        P2["video_info:<br/>Dict: job_id to {url, embedding}"]
+        P3["video_id_groups:<br/>Dict: video_id to list of job_ids"]
+        P4["duplicate_pairs:<br/>List of (job_id1, job_id2, similarity)"]
+        P5["chunk_duplicate_pairs:<br/>Within-chunk pairs"]
+        P6["cross_chunk_pairs:<br/>Cross-chunk pairs"]
+        P7["similarity_lookup:<br/>Dict: (job_id1, job_id2) to similarity"]
+        P8["graph:<br/>Dict: job_id to Set of neighbors"]
+        P9["clusters:<br/>List of Set of job_ids"]
         P10[originals:<br/>Set of job_ids]
         P11[unique_videos:<br/>List of {url, job_id}]
         P12[duplicates:<br/>List of {duplicate_url, original_url, similarity}]
@@ -342,7 +342,7 @@ flowchart TD
     
     SelectBest --> ExtractRes[📐 Extract Resolution<br/>✨ Multiple patterns:<br/>- FlashTalking: _width_height_bitrate_fps<br/>- Adnxs: _width_height_bitratek<br/>- VZ CDN: play_1080p<br/>- Query params: ?width=1920&height=1080<br/>- Standard: 1920x1080, 1080p]
     
-    ExtractRes --> CalcScore[📊 Calculate Score<br/>resolution_score = width × height<br/>Fallback: itag]
+    ExtractRes --> CalcScore["📊 Calculate Score<br/>resolution_score = width x height<br/>Fallback: itag"]
     
     CalcScore --> Sort[🔢 Sort by:<br/>1. resolution_score DESC<br/>2. itag DESC<br/>3. job_id ASC]
     
@@ -366,7 +366,7 @@ flowchart TD
     
     Cluster --> BuildDict[📚 Build Similarity Dict<br/>Optimize lookup]
     
-    BuildDict --> DFS[🔍 DFS with Validation<br/>Max path length = 2<br/>Path similarity >= threshold × 0.95<br/>Prevent transitive closure]
+    BuildDict --> DFS["🔍 DFS with Validation<br/>Max path length = 2<br/>Path similarity >= threshold x 0.95<br/>Prevent transitive closure"]
     
     DFS --> FindClusters[📊 Find Clusters<br/>Connected components]
     
@@ -538,7 +538,7 @@ flowchart TD
     CheckMultiple -->|No| KeepSingle[✅ Keep single video<br/>No duplicates in group]
     CheckMultiple -->|Yes| ExtractRes[📐 Extract Resolution<br/>for each video in group]
     
-    ExtractRes --> CalcScores[📊 Calculate resolution_score<br/>for each video<br/>score = width × height]
+    ExtractRes --> CalcScores["📊 Calculate resolution_score<br/>for each video<br/>score = width x height"]
     
     CalcScores --> Sort[🔢 Sort by:<br/>1. resolution_score DESC<br/>2. itag DESC<br/>3. job_id ASC]
     
@@ -559,11 +559,11 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Start[Start Clustering] --> BuildDict[📚 Build Similarity Dict<br/>job_id1, job_id2 → similarity<br/>Normalize: sort job_ids]
+    Start[Start Clustering] --> BuildDict["📚 Build Similarity Dict<br/>job_id1, job_id2 to similarity<br/>Normalize: sort job_ids"]
     
-    BuildDict --> BuildGraph[🕸️ Build Graph<br/>job_id → Set[neighbors]<br/>Exclude cross-chunk duplicates]
+    BuildDict --> BuildGraph["🕸️ Build Graph<br/>job_id to Set of neighbors<br/>Exclude cross-chunk duplicates"]
     
-    BuildGraph --> InitDFS[🔍 Initialize DFS<br/>visited = set()<br/>clusters = []]
+    BuildGraph --> InitDFS["🔍 Initialize DFS<br/>visited = set<br/>clusters = list"]
     
     InitDFS --> Iterate[Iterate through<br/>all job_ids<br/>Sorted by job_id number]
     
@@ -577,7 +577,7 @@ flowchart TD
     DFSStack --> CheckPath{Path length<br/>> max_path_length?<br/>default: 2}
     
     CheckPath -->|Yes| StopPath[⏹️ Stop this path<br/>Too long]
-    CheckPath -->|No| CheckSim{Path similarity<br/>< threshold × 0.95?}
+    CheckPath -->|No| CheckSim{"Path similarity<br/>< threshold x 0.95?"}
     
     CheckSim -->|Yes| StopPath
     CheckSim -->|No| AddNode[✅ Add node to cluster<br/>Mark as visited]
@@ -615,7 +615,7 @@ flowchart TD
     
     ExtractRes --> CheckRes{Resolution<br/>found?}
     
-    CheckRes -->|Yes| CalcScore[📊 Calculate score<br/>resolution_score = width × height<br/>Example: 1920×1080 = 2,073,600]
+    CheckRes -->|Yes| CalcScore["📊 Calculate score<br/>resolution_score = width x height<br/>Example: 1920x1080 = 2,073,600"]
     CheckRes -->|No| CheckItag{Has itag?}
     
     CheckItag -->|Yes| UseItag[Use itag as score<br/>Higher itag = better quality]
