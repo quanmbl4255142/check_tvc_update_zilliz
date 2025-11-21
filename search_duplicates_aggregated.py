@@ -1760,7 +1760,7 @@ def search_duplicates_aggregated(
                 # CRITICAL: If path similarity dropped below threshold, stop this path
                 # This prevents connecting nodes that are too dissimilar through a chain
                 # Use 90% of threshold to allow some tolerance for path decay
-                if min_sim < similarity_threshold * 0.9:
+                if min_sim < similarity_threshold * 0.95:
                     continue
             
             visited.add(node)
@@ -1810,7 +1810,7 @@ def search_duplicates_aggregated(
     for job_id in sorted(all_job_ids, key=lambda jid: extract_job_id_number(jid)):
         if job_id not in visited and job_id not in cross_chunk_duplicates:
             if use_validated_dfs:
-                cluster = dfs_iterative_with_validation(job_id, max_path_length=3)
+                cluster = dfs_iterative_with_validation(job_id, max_path_length=2)
             else:
                 cluster = dfs_iterative(job_id)
             if cluster:
