@@ -260,10 +260,17 @@ def extract_resolution_from_url(url: str) -> tuple[int, int]:
     Extract video resolution (width, height) from URL
     Returns (width, height) or (0, 0) if not found
     
+    ✨ ENHANCED: Now supports additional patterns for FlashTalking, Adnxs, VZ CDN, and query params
+    
     Tries multiple methods:
     1. Extract from itag (Google CDN)
-    2. Extract from URL pattern (e.g., 1920x1080, 1080p, play_1080p.mp4)
-    3. Extract from filename patterns
+    2. Extract from URL pattern (e.g., 1920x1080, 1920_1080)
+    3. Extract from FlashTalking pattern (e.g., {name}_{width}_{height}_{bitrate}_{fps}.mp4)
+    4. Extract from Adnxs pattern (e.g., {uuid}_{width}_{height}_{bitrate}k.{ext})
+    5. Extract from VZ CDN pattern (e.g., play_1080p.mp4)
+    6. Extract from query parameters (e.g., ?width=1920&height=1080)
+    7. Extract from resolution indicators (1080p, 720p, 4k, etc.)
+    8. Extract from filename patterns
     """
     if not url:
         return (0, 0)
@@ -308,6 +315,58 @@ def extract_resolution_from_url(url: str) -> tuple[int, int]:
         except:
             pass
     
+    # ========== NEW: FlashTalking pattern ==========
+    # Pattern: {name}_{width}_{height}_{bitrate}_{fps}.mp4
+    # Example: HS_CoolMen_GO_SEandOthers_15s_1920_1080_2500_3000.mp4
+    match = re.search(r'(\d{3,4})_(\d{3,4})_\d+_\d+\.mp4', url, re.IGNORECASE)
+    if match:
+        try:
+            width = int(match.group(1))
+            height = int(match.group(2))
+            if 100 <= width <= 7680 and 100 <= height <= 4320:
+                return (width, height)
+        except:
+            pass
+    
+    # ========== NEW: Adnxs pattern ==========
+    # Pattern: {uuid}_{width}_{height}_{bitrate}k.{ext}
+    # Example: 306b5dcf-93de-491b-90e7-baa057cb2259_1280_720_600k.webm
+    match = re.search(r'([a-f0-9-]{36})_(\d{3,4})_(\d{3,4})_\d+k\.(mp4|webm)', url, re.IGNORECASE)
+    if match:
+        try:
+            width = int(match.group(2))
+            height = int(match.group(3))
+            if 100 <= width <= 7680 and 100 <= height <= 4320:
+                return (width, height)
+        except:
+            pass
+    
+    # ========== NEW: VZ CDN pattern ==========
+    # Pattern: play_{resolution}.mp4
+    # Example: play_1080p.mp4, play_720p.mp4
+    match = re.search(r'play_(\d+)p\.mp4', url, re.IGNORECASE)
+    if match:
+        try:
+            height = int(match.group(1))
+            # Map height to standard resolutions
+            resolution_map = {
+                2160: (3840, 2160),  # 4K
+                1440: (2560, 1440),  # 1440p
+                1080: (1920, 1080),  # 1080p
+                720: (1280, 720),    # 720p
+                480: (854, 480),     # 480p
+                360: (640, 360),     # 360p
+                240: (426, 240),     # 240p
+            }
+            if height in resolution_map:
+                return resolution_map[height]
+            # Calculate width assuming 16:9 aspect ratio
+            width = int(height * 16 / 9)
+            if 100 <= width <= 7680 and 100 <= height <= 4320:
+                return (width, height)
+        except:
+            pass
+    
     # Method 3: Extract from resolution indicators (1080p, 720p, 4k, etc.)
     # Check for patterns like "1080p", "720p", "4k", "2160p"
     resolution_patterns = {
@@ -336,6 +395,35 @@ def extract_resolution_from_url(url: str) -> tuple[int, int]:
         if re.search(pattern, url_lower):
             return (w, h)
     
+    # ========== NEW: Extract from query parameters ==========
+    # Pattern: ?width=1920&height=1080 or ?w=1920&h=1080
+    from urllib.parse import urlparse, parse_qs
+    try:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        
+        # Try width/height
+        if 'width' in params and 'height' in params:
+            try:
+                width = int(params['width'][0])
+                height = int(params['height'][0])
+                if 100 <= width <= 7680 and 100 <= height <= 4320:
+                    return (width, height)
+            except:
+                pass
+        
+        # Try w/h
+        if 'w' in params and 'h' in params:
+            try:
+                width = int(params['w'][0])
+                height = int(params['h'][0])
+                if 100 <= width <= 7680 and 100 <= height <= 4320:
+                    return (width, height)
+            except:
+                pass
+    except:
+        pass
+    
     return (0, 0)
 
 
@@ -363,6 +451,9 @@ def extract_video_id_from_url(url: str) -> str:
     
     NOTE: Only extract for URLs where we're CERTAIN the ID represents the same video content.
     For Google CDN videoplayback, the same video ID with different signatures/expires/itags = same video.
+    
+    ✨ ENHANCED: Now supports 7 additional CDNs:
+    - FlashTalking, FPT Play, Adnxs, VZ CDN, UpPremium, BlueAdss, Adsrvr, AIActiv
     """
     if not url:
         return ""
@@ -389,6 +480,115 @@ def extract_video_id_from_url(url: str) -> str:
     match = re.search(r'youtu\.be/([a-zA-Z0-9_-]{11})', url)
     if match:
         return f"youtube_{match.group(1)}"
+    
+    # ========== NEW: FlashTalking CDN ==========
+    # Pattern: cdn.flashtalking.com/{account_id}/{filename}.mp4?cb={timestamp}
+    # Extract: {account_id}/{base_filename} (remove resolution and timestamp)
+    # Example: cdn.flashtalking.com/211217/HS_CoolMen_GO_SEandOthers_15s_1920_1080_2500_3000.mp4?cb=1734195360000
+    # 
+    # CRITICAL: Only group videos that have EXACT same base filename (before resolution pattern)
+    # Do NOT group videos with different suffixes like _S vs _N (South vs North) - these are different videos
+    match = re.search(r'cdn\.flashtalking\.com/(\d+)/([^/]+?)(?:_\d+_\d+_\d+_\d+)?\.mp4', url, re.IGNORECASE)
+    if match:
+        account_id = match.group(1)
+        filename = match.group(2)
+        # Remove resolution patterns: _1920_1080_2500_3000, _1280_720_1500_2997, etc.
+        # Pattern: _width_height_bitrate_fps (4 numbers separated by underscores)
+        # Keep base filename (e.g., "HS_CoolMen_GO_SEandOthers_15s" or "HS_30s_S" or "HS_30s_N")
+        # IMPORTANT: Keep suffixes like _S, _N, _South, _North - these indicate different videos
+        base_filename = re.sub(r'_\d+_\d+_\d+_\d+$', '', filename)
+        base_filename = re.sub(r'_\d+x\d+$', '', base_filename)
+        # Additional check: If filename ends with pattern like _S_ or _N_ followed by numbers, keep it
+        # This ensures HS_30s_S and HS_30s_N are treated as different videos
+        return f"flashtalking_{account_id}_{base_filename}"
+    
+    # ========== NEW: FPT Play CDN ==========
+    # Pattern: ads-cdn.fptplay.net/static/banner/{date}/{id}.mp4
+    # Extract: {id} (part after underscore in filename)
+    # Example: ads-cdn.fptplay.net/static/banner/2024/09/20_66ed1aa4dd956300017c5733.mp4
+    match = re.search(r'ads-cdn\.fptplay\.net/static/banner/[^/]+/([^/]+)\.mp4', url, re.IGNORECASE)
+    if match:
+        filename = match.group(1)
+        # Extract ID part after underscore (e.g., "20_66ed1aa4dd956300017c5733" -> "66ed1aa4dd956300017c5733")
+        parts = filename.split('_', 1)
+        if len(parts) > 1:
+            return f"fptplay_{parts[1]}"
+        return f"fptplay_{filename}"
+    
+    # ========== NEW: Adnxs CDN ==========
+    # Pattern: crcdn09.adnxs-simple.com/creative20/p/{publisher}/{date}/{creative_id}/{uuid}_{width}_{height}_{bitrate}k.{ext}
+    # Extract: {creative_id}/{uuid} or just {uuid}
+    # Example: crcdn09.adnxs-simple.com/creative20/p/15175/2024/8/30/60554548/306b5dcf-93de-491b-90e7-baa057cb2259_1280_720_600k.webm
+    match = re.search(r'adnxs-simple\.com/creative20/p/\d+/\d+/\d+/(\d+)/([a-f0-9-]{36})', url, re.IGNORECASE)
+    if match:
+        creative_id = match.group(1)
+        uuid = match.group(2)
+        return f"adnxs_{creative_id}_{uuid}"
+    
+    # ========== NEW: VZ CDN ==========
+    # Pattern: vz-{id}.b-cdn.net/{uuid}/play_{resolution}.mp4
+    # Extract: {uuid}
+    # Example: vz-8ac458ee-a59.b-cdn.net/35805fac-9411-4bef-a26f-42e029a45fab/play_1080p.mp4
+    match = re.search(r'vz-[^/]+\.b-cdn\.net/([a-f0-9-]{36})/', url, re.IGNORECASE)
+    if match:
+        uuid = match.group(1)
+        return f"vzcdn_{uuid}"
+    
+    # ========== NEW: UpPremium CDN ==========
+    # Pattern: cdn.upremium.asia/uploads/hosted/{date}/{filename}.mp4
+    # Extract: {base_filename} (remove timestamp prefix)
+    # Example: cdn.upremium.asia/uploads/hosted/2024/08/1723932599_c2_gardenia_mbapp6s_productintro_aug2024.mp4
+    match = re.search(r'cdn\.upremium\.asia/uploads/hosted/\d+/\d+_(.+)\.mp4', url, re.IGNORECASE)
+    if match:
+        base_filename = match.group(1)
+        return f"upremium_{base_filename}"
+    
+    # Fallback: Extract without timestamp
+    match = re.search(r'cdn\.upremium\.asia/uploads/hosted/[^/]+/([^/]+)\.mp4', url, re.IGNORECASE)
+    if match:
+        filename = match.group(1)
+        # Remove timestamp prefix if exists (e.g., "1723932599_filename" -> "filename")
+        base_filename = re.sub(r'^\d+_', '', filename)
+        return f"upremium_{base_filename}"
+    
+    # ========== NEW: BlueAdss CDN ==========
+    # Pattern: cdn.blueadss.com/files-blueseed/{path}/{filename}.mp4
+    # Extract: {filename} (or combine with path for uniqueness)
+    # Example: cdn.blueadss.com/files-blueseed/61/3065/17879/NiveaMicellarH22024_15s.mp4
+    match = re.search(r'cdn\.blueadss\.com/files-blueseed/([^/]+/[^/]+/[^/]+)/([^/]+)\.mp4', url, re.IGNORECASE)
+    if match:
+        path = match.group(1).replace('/', '_')
+        filename = match.group(2)
+        return f"blueadss_{path}_{filename}"
+    
+    # ========== NEW: Adsrvr CDN ==========
+    # Pattern: v.adsrvr.org/{path}/{filename}.mp4
+    # Extract: {filename} (UUID-like or hash)
+    # Example: v.adsrvr.org/7qps82d/yq2lp68/gq0dnqav9115fa8fdeed4ef88089cec513d745e4.mp4
+    match = re.search(r'v\.adsrvr\.org/[^/]+/[^/]+/([^/]+)\.mp4', url, re.IGNORECASE)
+    if match:
+        filename = match.group(1)
+        return f"adsrvr_{filename}"
+    
+    # ========== NEW: AIActiv CDN ==========
+    # Pattern: static.aiactiv.io/video/{filename}.mp4
+    # Extract: {base_filename} (remove suffix like _1000000, _7000000)
+    # Example: static.aiactiv.io/video/tvc-green-soy-15s-add-super-1-mp4_3be53cca-5b79-40f9-8651-c64eb48b1ca9.mp4
+    match = re.search(r'static\.aiactiv\.io/video/([^/]+)\.mp4', url, re.IGNORECASE)
+    if match:
+        filename = match.group(1)
+        # Remove numeric suffix (e.g., "filename_1000000" -> "filename")
+        base_filename = re.sub(r'_\d+$', '', filename)
+        return f"aiactiv_{base_filename}"
+    
+    # ========== NEW: FPT Play VOD ==========
+    # Pattern: ads-cdn.fptplay.net/vod/transcoded/{hash}/index.m3u8
+    # Extract: {hash}
+    # Example: ads-cdn.fptplay.net/vod/transcoded/F5DF2752A2E895F4825DEEA21B429E3C/index.m3u8
+    match = re.search(r'ads-cdn\.fptplay\.net/vod/transcoded/([A-F0-9]+)/', url, re.IGNORECASE)
+    if match:
+        hash_val = match.group(1)
+        return f"fptplay_vod_{hash_val}"
     
     # NOTE: We DON'T use generic /video/ pattern because different videos can have similar paths
     # Only use patterns where we're CERTAIN the ID uniquely identifies the video content
@@ -1350,32 +1550,42 @@ def search_duplicates_aggregated(
                 continue
             
             if len(job_ids) > 1:
-                # NEW: Prefer video with highest itag (highest resolution) instead of smallest job_id
+                # CRITICAL FIX: Use resolution_score instead of just itag
+                # FlashTalking and other CDNs don't have itag, so we need to use resolution extraction
                 # This ensures we keep the best quality version when multiple resolutions exist
-                job_id_with_itag = []
+                job_id_with_score = []
                 for jid in job_ids:
                     url = video_info[jid]["url"]
+                    resolution_score = get_resolution_score(url)  # Use resolution score (width * height)
                     itag = extract_itag_from_url(url)
                     job_id_num = extract_job_id_number(jid)
-                    # Store: (itag, job_id_num, job_id)
-                    # Sort by itag DESC (highest first), then job_id_num ASC (smallest) as tiebreaker
-                    job_id_with_itag.append((itag, job_id_num, jid))
+                    # Store: (resolution_score, itag, job_id_num, job_id)
+                    # Sort by resolution_score DESC (highest first), then itag DESC, then job_id_num ASC
+                    job_id_with_score.append((resolution_score, itag, job_id_num, jid))
                 
-                # Sort: first by itag (descending - highest resolution first), then by job_id (ascending - smallest as tiebreaker)
-                job_id_with_itag.sort(key=lambda x: (-x[0], x[1]))  # Negative itag for descending
+                # Sort: first by resolution_score (descending - highest resolution first), 
+                # then by itag (descending), then by job_id (ascending - smallest as tiebreaker)
+                job_id_with_score.sort(key=lambda x: (-x[0], -x[1], x[2]))  # Negative for descending
                 
-                # Keep the one with highest itag (or smallest job_id if no itag)
-                best_job_id = job_id_with_itag[0][2]
-                best_itag = job_id_with_itag[0][0]
+                # Keep the one with highest resolution score
+                best_job_id = job_id_with_score[0][3]
+                best_resolution_score = job_id_with_score[0][0]
+                best_itag = job_id_with_score[0][1]
                 
                 video_id_to_keep[video_id] = best_job_id
                 url_duplicates_removed += len(job_ids) - 1
                 
                 # DEBUG: Log which video was kept and why
-                if best_itag > 0:
-                    print(f"      → Kept {best_job_id} (itag={best_itag}, highest resolution) from {len(job_ids)} videos")
+                if best_resolution_score > 0:
+                    width, height = extract_resolution_from_url(video_info[best_job_id]["url"])
+                    if width > 0 and height > 0:
+                        print(f"      → Kept {best_job_id} (resolution={width}x{height}, score={best_resolution_score}) from {len(job_ids)} videos")
+                    elif best_itag > 0:
+                        print(f"      → Kept {best_job_id} (itag={best_itag}, score={best_resolution_score}) from {len(job_ids)} videos")
+                    else:
+                        print(f"      → Kept {best_job_id} (score={best_resolution_score}) from {len(job_ids)} videos")
                 else:
-                    print(f"      → Kept {best_job_id} (no itag, smallest job_id) from {len(job_ids)} videos")
+                    print(f"      → Kept {best_job_id} (no resolution info, smallest job_id) from {len(job_ids)} videos")
         
         if url_duplicates_removed > 0:
             print(f"   ✅ Found {len(video_id_groups)} unique video IDs")
